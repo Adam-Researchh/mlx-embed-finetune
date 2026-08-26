@@ -2,37 +2,44 @@
 """
 MLX embedding model fine-tuning with LoRA on Apple Silicon.
 
-This script fine-tunes encoder-style embedding models such as BERT,
-XLM-RoBERTa, and BGE variants using MLX on Metal.
+Fine-tunes encoder-style embedding models such as BERT, XLM-RoBERTa and BGE
+variants using MLX on Metal.
 
 Features:
-- LoRA adapters on attention query/value projections
-- InfoNCE / MultipleNegativesRankingLoss training
+- LoRA adapters on attention query/value projections (fp16/bf16 and quantized)
+- InfoNCE / MultipleNegativesRankingLoss with optional explicit hard negatives
+- False-negative masking for duplicate positives inside a batch
+- Optional Matryoshka (MRL) multi-dimension loss
+- Gradient accumulation for a larger effective batch (more in-batch negatives)
 - Decoupled weight-decay optimizer with warmup + cosine decay
-- Periodic evaluation and best-checkpoint saving
+- Periodic evaluation, best-checkpoint tracking, and best-checkpoint export
 - LoRA checkpoint export and merged model export
 - Dry-run mode for throughput estimation
 
 Training data format (JSONL):
-    {"query": "...", "positive": "...", "negatives": ["..."]}
+    {"query": "...", "positive": "...", "negatives": ["...", "..."]}
 
-The negatives field is optional during training because the loss uses
-in-batch negatives automatically. It is still useful for evaluation.
+`negatives` is optional. When present it is used as explicit hard negatives in
+the loss, which is the strongest quality lever available here: with random
+in-batch negatives alone a well-trained base model often sits near zero loss
+and receives almost no gradient signal.
 """
 
 import argparse
+import inspect
 import json
 import math
 import random
+import re
 import shutil
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as opt
-from mlx.utils import tree_flatten, tree_unflatten
+from mlx.utils import tree_flatten, tree_map, tree_unflatten
 from mlx_embeddings.tokenizer_utils import load_tokenizer
 from mlx_embeddings.utils import get_model_path, load_model
 from mlx_lm.tuner.lora import LoRALinear
@@ -41,6 +48,31 @@ DEFAULT_MODEL = "mlx-community/bge-m3-mlx-fp16"
 DEFAULT_TEMPERATURE = 0.05
 DEFAULT_MAX_LENGTH = 512
 DEFAULT_TARGET_MODULES = ["query", "value"]
+
+# Layer types LoRA can wrap. QuantizedLinear is NOT a subclass of nn.Linear,
+# so it must be named explicitly or every projection in a quantized model is
+# silently skipped. mlx_lm's LoRALinear.from_base handles both.
+ADAPTABLE_LINEAR_TYPES = (nn.Linear, nn.QuantizedLinear)
+
+# Attention-projection presets, tried in order when --target-modules is "auto".
+# Targeting is by module PATH, not by walking a fixed structure, because every
+# generation of encoder names its blocks differently: BERT/XLM-R use
+# encoder.layer[*].attention.self.query, ModernBERT uses layers[*].attn.Wqkv
+# (a FUSED qkv projection, so "query,value" is not even expressible there), and
+# decoder-style embedders use self_attn.q_proj / v_proj.
+ARCH_PRESETS = [
+    ("bert/xlm-roberta", [r"attention\.self\.(query|value)$"]),
+    ("modernbert",       [r"attn\.(Wqkv|Wo)$"]),
+    ("decoder-style",    [r"self_attn\.(q_proj|v_proj)$"]),
+]
+
+# Every linear layer in a transformer block. The QLoRA paper's finding is that
+# adapting all linear layers at low rank beats adapting a couple at high rank.
+ALL_LINEAR_PRESET = [r"(?:^|\.)(?:layers?|layer)\.\d+\..*$"]
+
+
+class NoAdaptedLayersError(RuntimeError):
+    """Raised when LoRA matched nothing, instead of training zero parameters."""
 
 
 def load_pairs(path: str) -> List[Dict]:
@@ -63,9 +95,79 @@ def load_pairs(path: str) -> List[Dict]:
 
 
 def batch_pairs(pairs: List[Dict], batch_size: int):
+    """Yield (queries, positives, hard_negatives) triples.
+
+    hard_negatives is a flat list pooled across the batch; every row sees every
+    other row's hard negatives as additional negatives, which is standard
+    practice and costs nothing extra.
+    """
     for i in range(0, len(pairs), batch_size):
         batch = pairs[i : i + batch_size]
-        yield [p["query"] for p in batch], [p["positive"] for p in batch]
+        queries = [p["query"] for p in batch]
+        positives = [p["positive"] for p in batch]
+        negatives: List[str] = []
+        for p in batch:
+            for neg in p.get("negatives") or []:
+                if isinstance(neg, str) and neg:
+                    negatives.append(neg)
+        yield queries, positives, negatives
+
+
+def compile_target_patterns(spec: str) -> List[re.Pattern]:
+    """Turn a --target-modules spec into regexes.
+
+    A bare name like `query` is treated as a path suffix (a path-suffix match) so the
+    original CLI keeps working; anything containing regex metacharacters is used
+    as written.
+    """
+    patterns = []
+    for raw in spec.split(","):
+        token = raw.strip()
+        if not token:
+            continue
+        if re.search(r"[\\^$.|?*+()\[\]{}]", token):
+            patterns.append(re.compile(token))
+        else:
+            patterns.append(re.compile(rf"(?:^|\.){re.escape(token)}$"))
+    if not patterns:
+        raise ValueError("--target-modules resolved to no patterns")
+    return patterns
+
+
+def find_adaptable(model: nn.Module, patterns: Sequence[re.Pattern]) -> List[Tuple[str, nn.Module]]:
+    return [
+        (name, module)
+        for name, module in model.named_modules()
+        if name
+        and isinstance(module, ADAPTABLE_LINEAR_TYPES)
+        and any(p.search(name) for p in patterns)
+    ]
+
+
+def resolve_targets(model: nn.Module, spec: str) -> Tuple[str, List[Tuple[str, nn.Module]]]:
+    """Pick the module set to adapt, auto-detecting the architecture if asked."""
+    if spec == "all-linear":
+        patterns = [re.compile(p) for p in ALL_LINEAR_PRESET]
+        return "all-linear", find_adaptable(model, patterns)
+
+    if spec != "auto":
+        return spec, find_adaptable(model, compile_target_patterns(spec))
+
+    for preset_name, raw_patterns in ARCH_PRESETS:
+        patterns = [re.compile(p) for p in raw_patterns]
+        found = find_adaptable(model, patterns)
+        if found:
+            return f"auto:{preset_name}", found
+    return "auto", []
+
+
+def describe_linear_paths(model: nn.Module, limit: int = 12) -> List[str]:
+    paths = [
+        name
+        for name, module in model.named_modules()
+        if name and isinstance(module, ADAPTABLE_LINEAR_TYPES)
+    ]
+    return paths[:limit]
 
 
 def apply_lora_to_model(
@@ -73,37 +175,45 @@ def apply_lora_to_model(
     rank: int = 8,
     alpha: float = 16.0,
     dropout: float = 0.0,
-    target_modules: Optional[List[str]] = None,
+    target_spec: str = "auto",
 ) -> nn.Module:
-    if target_modules is None:
-        target_modules = DEFAULT_TARGET_MODULES
+    """Insert LoRA adapters by module path.
 
+    This deliberately makes no assumption about the model's block structure —
+    it walks every module, matches paths, and replaces what it finds. That is
+    what lets one script cover BERT, XLM-RoBERTa, ModernBERT and decoder-style
+    embedders instead of only the architecture it was written against.
+    """
     scale = alpha / rank
-    adapted = 0
+    resolved_spec, targets = resolve_targets(model, target_spec)
 
-    for layer in model.encoder.layer:
-        attention = layer.attention.self
-        replacements = []
-        for module_name in target_modules:
-            if hasattr(attention, module_name):
-                original_linear = getattr(attention, module_name)
-                if isinstance(original_linear, nn.Linear):
-                    replacements.append(
-                        (
-                            module_name,
-                            LoRALinear.from_base(
-                                original_linear,
-                                r=rank,
-                                dropout=dropout,
-                                scale=scale,
-                            ),
-                        )
-                    )
-                    adapted += 1
-        if replacements:
-            attention.update_modules(tree_unflatten(replacements))
+    if not targets:
+        raise NoAdaptedLayersError(
+            "LoRA adapted 0 layers, so there would be nothing to train.\n"
+            f"  --target-modules: {target_spec} (resolved as {resolved_spec})\n"
+            f"  adaptable linear paths in this model (first {len(describe_linear_paths(model))}):\n"
+            + "".join(f"    {p}\n" for p in describe_linear_paths(model))
+            + "  Pass --target-modules with a name or regex matching those paths, "
+            "or --target-modules all-linear."
+        )
 
-    print(f"Applied LoRA to {adapted} layers (rank={rank}, alpha={alpha}, scale={scale:.2f})")
+    model.update_modules(
+        tree_unflatten(
+            [
+                (
+                    name,
+                    LoRALinear.from_base(module, r=rank, dropout=dropout, scale=scale),
+                )
+                for name, module in targets
+            ]
+        )
+    )
+
+    quantized = sum(1 for _, m in targets if isinstance(m, nn.QuantizedLinear))
+    suffix = f", {quantized} quantized (QLoRA)" if quantized else ""
+    print(f"Applied LoRA to {len(targets)} modules via {resolved_spec} "
+          f"(rank={rank}, alpha={alpha}, scale={scale:.2f}{suffix})")
+    print(f"  e.g. {targets[0][0]}")
     return model
 
 
@@ -112,6 +222,12 @@ def freeze_base_and_enable_lora(model: nn.Module) -> nn.Module:
     for _, module in model.named_modules():
         if isinstance(module, LoRALinear):
             module.unfreeze(keys=["lora_a", "lora_b"], recurse=False)
+    trainable = sum(param.size for _, param in tree_flatten(model.trainable_parameters()))
+    if trainable == 0:
+        raise NoAdaptedLayersError(
+            "No trainable parameters after freezing the base model. "
+            "LoRA adapters were not registered correctly."
+        )
     return model
 
 
@@ -135,21 +251,133 @@ def tokenize_batch(tokenizer, texts: List[str], max_length: int = DEFAULT_MAX_LE
     }
 
 
-def encode_texts(model: nn.Module, input_ids: mx.array, attention_mask: mx.array) -> mx.array:
-    output = model(input_ids=input_ids, attention_mask=attention_mask)
-    return output.text_embeds
+def detect_input_kwarg(model: nn.Module) -> str:
+    """Find whether this model's forward takes `input_ids` or `inputs`.
+
+    mlx-embeddings is not uniform here: encoder models (bert, xlm_roberta,
+    modernbert) take `input_ids`, while decoder-style embedders (gemma3_text,
+    qwen3) take `inputs`. Detecting once at load time keeps one training loop
+    working across both instead of hardcoding one family's convention.
+    """
+    try:
+        params = inspect.signature(model.__call__).parameters
+    except (TypeError, ValueError):
+        return "input_ids"
+    for candidate in ("input_ids", "inputs", "input_tokens"):
+        if candidate in params:
+            return candidate
+    raise TypeError(
+        "Could not find a token-input argument on this model's forward pass; "
+        f"signature is {inspect.signature(model.__call__)}"
+    )
 
 
-def contrastive_loss(
-    query_embeds: mx.array,
-    positive_embeds: mx.array,
-    temperature: float = DEFAULT_TEMPERATURE,
+def apply_prefix(texts: Sequence[str], prefix: str) -> List[str]:
+    """Prepend an instruction prefix, if one is configured.
+
+    Asymmetric query/document prefixes are how modern retrieval encoders were
+    pretrained. Training without the prefix a model expects moves it off its
+    own distribution, and inference must use the same prefixes -- so they are
+    recorded in the exported metadata.
+    """
+    if not prefix:
+        return list(texts)
+    return [prefix + t for t in texts]
+
+
+def l2_normalize(x: mx.array, eps: float = 1e-12) -> mx.array:
+    return x / mx.maximum(mx.linalg.norm(x, axis=-1, keepdims=True), eps)
+
+
+def encode_texts(
+    model: nn.Module,
+    input_ids: mx.array,
+    attention_mask: mx.array,
+    normalize: bool = True,
+    input_kwarg: str = "input_ids",
 ) -> mx.array:
-    similarity = query_embeds @ positive_embeds.T
-    logits = similarity / temperature
-    labels = mx.arange(query_embeds.shape[0])
+    """Encode a batch of texts.
+
+    mlx-embeddings already returns L2-normalized `text_embeds` for the models
+    tested here, so normalizing again is a no-op for them. It is kept explicit
+    and on by default because the InfoNCE temperature (0.05) is only meaningful
+    on unit vectors, and a converted encoder that does not normalize would
+    otherwise train on saturated logits without any error being raised.
+    """
+    output = model(**{input_kwarg: input_ids}, attention_mask=attention_mask)
+    embeds = output.text_embeds
+    return l2_normalize(embeds) if normalize else embeds
+
+
+def build_false_negative_mask(positives: Sequence[str], negatives: Sequence[str]) -> Optional[mx.array]:
+    """Mask candidates that duplicate a row's own positive text.
+
+    Without this, two rows sharing (or repeating) a positive teach the model
+    that a correct match is wrong.
+    """
+    candidates = list(positives) + list(negatives)
+    batch_size = len(positives)
+    mask_rows = []
+    needs_mask = False
+    for i in range(batch_size):
+        row = []
+        for j, text in enumerate(candidates):
+            duplicate = (j != i) and (text == positives[i])
+            if duplicate:
+                needs_mask = True
+            row.append(-1e9 if duplicate else 0.0)
+        mask_rows.append(row)
+    if not needs_mask:
+        return None
+    return mx.array(mask_rows)
+
+
+def info_nce_loss(
+    query_embeds: mx.array,
+    candidate_embeds: mx.array,
+    temperature: float = DEFAULT_TEMPERATURE,
+    mask: Optional[mx.array] = None,
+) -> mx.array:
+    """InfoNCE / MultipleNegativesRankingLoss.
+
+    candidate_embeds is [positives; pooled_hard_negatives]; the correct answer
+    for row i is column i.
+    """
+    batch_size = query_embeds.shape[0]
+    logits = (query_embeds @ candidate_embeds.T) / temperature
+    if mask is not None:
+        logits = logits + mask
     log_probs = logits - mx.logsumexp(logits, axis=1, keepdims=True)
-    return -mx.mean(log_probs[mx.arange(query_embeds.shape[0]), labels])
+    targets = mx.arange(batch_size)
+    return -mx.mean(log_probs[targets, targets])
+
+
+def matryoshka_loss(
+    query_embeds: mx.array,
+    candidate_embeds: mx.array,
+    dims: Sequence[int],
+    temperature: float,
+    mask: Optional[mx.array],
+) -> mx.array:
+    """Matryoshka Representation Learning: train nested prefixes jointly.
+
+    Produces embeddings that stay useful when truncated, so downstream indexes
+    can trade recall for memory without retraining.
+    """
+    full_dim = query_embeds.shape[-1]
+    total = None
+    used = 0
+    for dim in dims:
+        if dim > full_dim:
+            continue
+        q = l2_normalize(query_embeds[:, :dim])
+        c = l2_normalize(candidate_embeds[:, :dim])
+        term = info_nce_loss(q, c, temperature, mask)
+        total = term if total is None else total + term
+        used += 1
+    if total is None:
+        raise ValueError(f"No Matryoshka dims <= embedding dim {full_dim}: {list(dims)}")
+    return total / used
 
 
 def evaluate_loss(
@@ -159,45 +387,84 @@ def evaluate_loss(
     batch_size: int,
     temperature: float,
     max_length: int,
+    normalize: bool,
+    use_hard_negatives: bool,
+    query_prefix: str = "",
+    doc_prefix: str = "",
+    input_kwarg: str = "input_ids",
 ) -> float:
     total_loss = 0.0
     num_batches = 0
-    for queries, positives in batch_pairs(eval_pairs, batch_size):
-        q_tokens = tokenize_batch(tokenizer, queries, max_length)
-        p_tokens = tokenize_batch(tokenizer, positives, max_length)
-        q_embeds = encode_texts(model, q_tokens["input_ids"], q_tokens["attention_mask"])
-        p_embeds = encode_texts(model, p_tokens["input_ids"], p_tokens["attention_mask"])
-        loss = contrastive_loss(q_embeds, p_embeds, temperature)
+    for queries, positives, negatives in batch_pairs(eval_pairs, batch_size):
+        if not use_hard_negatives:
+            negatives = []
+        q_tokens = tokenize_batch(tokenizer, apply_prefix(queries, query_prefix), max_length)
+        c_texts = apply_prefix(positives + negatives, doc_prefix)
+        c_tokens = tokenize_batch(tokenizer, c_texts, max_length)
+        q_embeds = encode_texts(model, q_tokens["input_ids"], q_tokens["attention_mask"], normalize, input_kwarg)
+        c_embeds = encode_texts(model, c_tokens["input_ids"], c_tokens["attention_mask"], normalize, input_kwarg)
+        mask = build_false_negative_mask(positives, negatives)
+        loss = info_nce_loss(q_embeds, c_embeds, temperature, mask)
         mx.eval(loss)
         total_loss += loss.item()
         num_batches += 1
     return total_loss / max(num_batches, 1)
 
 
+def lora_weight_dict(model: nn.Module) -> Dict[str, mx.array]:
+    return {
+        name: param
+        for name, param in tree_flatten(model.parameters())
+        if "lora_a" in name or "lora_b" in name
+    }
+
+
 def save_lora_checkpoint(model: nn.Module, output_dir: str, step: int, lora_config: Dict) -> Path:
     ckpt_path = Path(output_dir) / f"checkpoint-{step}"
     ckpt_path.mkdir(parents=True, exist_ok=True)
-
-    lora_weights = {}
-    for name, param in tree_flatten(model.parameters()):
-        if "lora_a" in name or "lora_b" in name:
-            lora_weights[name] = param
-
-    mx.save_safetensors(str(ckpt_path / "adapters.safetensors"), lora_weights)
+    mx.save_safetensors(str(ckpt_path / "adapters.safetensors"), lora_weight_dict(model))
     with open(ckpt_path / "adapter_config.json", "w", encoding="utf-8") as f:
         json.dump(lora_config, f, indent=2)
     return ckpt_path
 
 
-def merge_and_save(model: nn.Module, model_name: str, output_dir: str) -> Path:
+def prune_checkpoints(output_dir: str, keep: int) -> None:
+    """Keep only the `keep` most recent numbered checkpoints ('best' is never pruned)."""
+    if keep <= 0:
+        return
+    root = Path(output_dir)
+    checkpoints = sorted(
+        (p for p in root.glob("checkpoint-*") if p.is_dir()),
+        key=lambda p: int(p.name.split("-")[-1]),
+    )
+    for stale in checkpoints[:-keep]:
+        shutil.rmtree(stale, ignore_errors=True)
+
+
+def load_lora_checkpoint(model: nn.Module, ckpt_dir: Path) -> nn.Module:
+    """Restore adapter weights from a checkpoint directory into the live model."""
+    weights_file = ckpt_dir / "adapters.safetensors"
+    if not weights_file.exists():
+        raise FileNotFoundError(f"No adapters.safetensors in {ckpt_dir}")
+    weights = mx.load(str(weights_file))
+    model.update(tree_unflatten(list(weights.items())))
+    mx.eval(model.parameters())
+    return model
+
+
+def merge_and_save(model: nn.Module, model_name: str, output_dir: str,
+                   query_prefix: str = "", doc_prefix: str = "") -> Path:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
     fused_layers = []
     fused_count = 0
+    dequantized = False
     for name, module in model.named_modules():
         if isinstance(module, LoRALinear):
-            fused_layers.append((name, module.fuse()))
+            is_quantized = isinstance(module.linear, nn.QuantizedLinear)
+            fused_layers.append((name, module.fuse(dequantize=is_quantized)))
+            dequantized = dequantized or is_quantized
             fused_count += 1
 
     if fused_layers:
@@ -213,6 +480,7 @@ def merge_and_save(model: nn.Module, model_name: str, output_dir: str) -> Path:
         "config.json",
         "tokenizer_config.json",
         "tokenizer.json",
+        "vocab.txt",
         "sentencepiece.bpe.model",
         "special_tokens_map.json",
         "1_Pooling/config.json",
@@ -229,12 +497,23 @@ def merge_and_save(model: nn.Module, model_name: str, output_dir: str) -> Path:
         "base_model": model_name,
         "fine_tuning": "lora",
         "framework": "mlx",
+        "fused_layers": fused_count,
+        "dequantized_on_merge": dequantized,
+        "query_prefix": query_prefix,
+        "doc_prefix": doc_prefix,
+        "prefix_note": (
+            "Inference MUST use the same prefixes these weights were trained with."
+            if (query_prefix or doc_prefix)
+            else "Trained without instruction prefixes."
+        ),
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "notes": "Merged LoRA adapter weights for encoder fine-tuning.",
     }
     with open(output_path / "training_metadata.json", "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
 
+    if dequantized:
+        print("Note: base layers were quantized; merged weights are dequantized.")
     print(f"Saved merged model with {fused_count} fused LoRA layers to {output_path}")
     return output_path
 
@@ -243,33 +522,53 @@ def train(args):
     print("\n" + "=" * 60)
     print("MLX EMBEDDING FINE-TUNING")
     print("=" * 60)
-    print(f"Model:         {args.model}")
-    print(f"Train data:    {args.train_pairs}")
-    print(f"Eval data:     {args.eval_pairs or 'None'}")
-    print(f"Epochs:        {args.epochs}")
-    print(f"Batch size:    {args.batch_size}")
-    print(f"Learning rate: {args.learning_rate}")
-    print(f"LoRA rank:     {args.lora_rank}")
-    print(f"LoRA alpha:    {args.lora_alpha}")
-    print(f"Temperature:   {args.temperature}")
-    print(f"Max length:    {args.max_length}")
-    print(f"Output:        {args.output_dir}")
-    print(f"Dry run:       {args.dry_run}")
+    print(f"Model:            {args.model}")
+    print(f"Train data:       {args.train_pairs}")
+    print(f"Eval data:        {args.eval_pairs or 'None'}")
+    print(f"Epochs:           {args.epochs}")
+    print(f"Batch size:       {args.batch_size} x {args.grad_accum_steps} accum "
+          f"= {args.batch_size * args.grad_accum_steps} effective")
+    print(f"Learning rate:    {args.learning_rate}")
+    print(f"LoRA rank/alpha:  {args.lora_rank} / {args.lora_alpha}")
+    print(f"Temperature:      {args.temperature}")
+    print(f"Max length:       {args.max_length}")
+    print(f"Hard negatives:   {not args.no_hard_negatives}")
+    print(f"Query prefix:     {args.query_prefix!r}")
+    print(f"Doc prefix:       {args.doc_prefix!r}")
+    print(f"Target modules:   {args.target_modules}")
+    print(f"Normalize embeds: {not args.no_normalize}")
+    print(f"Matryoshka dims:  {args.matryoshka_dims or 'disabled'}")
+    print(f"Output:           {args.output_dir}")
+    print(f"Dry run:          {args.dry_run}")
+
+    normalize = not args.no_normalize
+    use_hard_negatives = not args.no_hard_negatives
+    matryoshka_dims = (
+        [int(d) for d in args.matryoshka_dims.split(",")] if args.matryoshka_dims else None
+    )
 
     print("\nStep 1: Loading model...")
     t0 = time.time()
     model_path = get_model_path(args.model)
-    model = load_model(model_path, lazy=False, path_to_repo=args.model)
+    model = load_model(model_path, lazy=False)
     tokenizer = load_tokenizer(model_path)
     print(f"Loaded in {time.time() - t0:.1f}s")
 
+    input_kwarg = detect_input_kwarg(model)
+    if input_kwarg != "input_ids":
+        print(f"Model forward takes `{input_kwarg}` rather than `input_ids`; adapting call.")
+
     probe = tokenizer(["test"], return_tensors="np", padding=True)
     probe_out = model(
-        input_ids=mx.array(probe["input_ids"]),
+        **{input_kwarg: mx.array(probe["input_ids"])},
         attention_mask=mx.array(probe["attention_mask"]),
     )
     mx.eval(probe_out.text_embeds)
-    print(f"Embedding dimension: {probe_out.text_embeds.shape[-1]}")
+    embed_dim = probe_out.text_embeds.shape[-1]
+    probe_norm = float(mx.linalg.norm(probe_out.text_embeds[0]).item())
+    print(f"Embedding dimension: {embed_dim}")
+    print(f"Base embedding L2 norm: {probe_norm:.4f}"
+          f"{' (already normalized)' if abs(probe_norm - 1.0) < 1e-3 else ''}")
 
     print("\nStep 2: Applying LoRA adapters...")
     model = apply_lora_to_model(
@@ -277,6 +576,7 @@ def train(args):
         rank=args.lora_rank,
         alpha=args.lora_alpha,
         dropout=args.lora_dropout,
+        target_spec=args.target_modules,
     )
     model = freeze_base_and_enable_lora(model)
     total_params, trainable_params = count_parameters(model)
@@ -286,56 +586,78 @@ def train(args):
     print("\nStep 3: Loading data...")
     train_pairs = load_pairs(args.train_pairs)
     eval_pairs = load_pairs(args.eval_pairs) if args.eval_pairs else None
-    print(f"Loaded {len(train_pairs)} training pairs")
+    if not train_pairs:
+        raise ValueError(f"No usable training pairs in {args.train_pairs}")
+    with_negatives = sum(1 for p in train_pairs if p.get("negatives"))
+    print(f"Loaded {len(train_pairs)} training pairs ({with_negatives} with hard negatives)")
+    if use_hard_negatives and with_negatives == 0:
+        print("Note: no hard negatives present; falling back to in-batch negatives only.")
     if eval_pairs:
         print(f"Loaded {len(eval_pairs)} eval pairs")
 
-    steps_per_epoch = math.ceil(len(train_pairs) / args.batch_size)
+    micro_steps_per_epoch = math.ceil(len(train_pairs) / args.batch_size)
+    steps_per_epoch = math.ceil(micro_steps_per_epoch / args.grad_accum_steps)
     total_steps = steps_per_epoch * args.epochs
     warmup_steps = max(1, int(total_steps * 0.1))
-    print(f"Steps per epoch: {steps_per_epoch}")
-    print(f"Total steps:     {total_steps}")
+    print(f"Optimizer steps per epoch: {steps_per_epoch}")
+    print(f"Total optimizer steps:     {total_steps}")
 
     print("\nStep 4: Setting up optimizer...")
     warmup_fn = opt.schedulers.linear_schedule(init=0.0, end=args.learning_rate, steps=warmup_steps)
     cosine_fn = opt.schedulers.cosine_decay(init=args.learning_rate, decay_steps=max(1, total_steps - warmup_steps))
     lr_schedule = opt.schedulers.join_schedules([warmup_fn, cosine_fn], [warmup_steps])
-    optimizer_cls = getattr(opt, "A" + "damW")
-    optimizer = optimizer_cls(learning_rate=lr_schedule, weight_decay=args.weight_decay)
-    print(f"Optimizer: decoupled weight decay (weight_decay={args.weight_decay})")
+    optimizer = opt.AdamW(learning_rate=lr_schedule, weight_decay=args.weight_decay)
+    print(f"Optimizer: AdamW (decoupled weight decay={args.weight_decay})")
     print(f"LR schedule: linear warmup ({warmup_steps} steps) -> cosine decay")
 
-    def loss_fn(model, q_ids, q_mask, p_ids, p_mask):
-        q_embeds = encode_texts(model, q_ids, q_mask)
-        p_embeds = encode_texts(model, p_ids, p_mask)
-        return contrastive_loss(q_embeds, p_embeds, args.temperature)
+    def loss_fn(model, q_ids, q_mask, c_ids, c_mask, fn_mask):
+        q_embeds = encode_texts(model, q_ids, q_mask, normalize, input_kwarg)
+        c_embeds = encode_texts(model, c_ids, c_mask, normalize, input_kwarg)
+        if matryoshka_dims:
+            return matryoshka_loss(q_embeds, c_embeds, matryoshka_dims, args.temperature, fn_mask)
+        return info_nce_loss(q_embeds, c_embeds, args.temperature, fn_mask)
 
     loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
+
+    def prepare_batch(queries, positives, negatives):
+        if not use_hard_negatives:
+            negatives = []
+        q_tokens = tokenize_batch(tokenizer, apply_prefix(queries, args.query_prefix), args.max_length)
+        c_tokens = tokenize_batch(
+            tokenizer, apply_prefix(positives + negatives, args.doc_prefix), args.max_length
+        )
+        fn_mask = build_false_negative_mask(positives, negatives)
+        return q_tokens, c_tokens, fn_mask
 
     if args.dry_run:
         print("\n" + "=" * 60)
         print("DRY RUN")
         print("=" * 60)
-        queries = [p["query"] for p in train_pairs[: args.batch_size]]
-        positives = [p["positive"] for p in train_pairs[: args.batch_size]]
-        q_tokens = tokenize_batch(tokenizer, queries, args.max_length)
-        p_tokens = tokenize_batch(tokenizer, positives, args.max_length)
-        print(f"Batch size: {len(queries)}")
-        print(f"Query token shape:    {q_tokens['input_ids'].shape}")
-        print(f"Positive token shape: {p_tokens['input_ids'].shape}")
+        queries, positives, negatives = next(batch_pairs(train_pairs, args.batch_size))
+        q_tokens, c_tokens, fn_mask = prepare_batch(queries, positives, negatives)
+        print(f"Batch size: {len(queries)} queries vs {c_tokens['input_ids'].shape[0]} candidates "
+              f"({len(positives)} positives + {c_tokens['input_ids'].shape[0] - len(positives)} hard negatives)")
+        print(f"Query token shape:     {q_tokens['input_ids'].shape}")
+        print(f"Candidate token shape: {c_tokens['input_ids'].shape}")
+        print(f"False-negative mask:   {'applied' if fn_mask is not None else 'not needed'}")
         t0 = time.time()
         loss, grads = loss_and_grad_fn(
             model,
             q_tokens["input_ids"], q_tokens["attention_mask"],
-            p_tokens["input_ids"], p_tokens["attention_mask"],
+            c_tokens["input_ids"], c_tokens["attention_mask"],
+            fn_mask,
         )
         mx.eval(loss, grads)
         elapsed = time.time() - t0
+        grad_norm = math.sqrt(sum(float(mx.sum(g * g).item()) for _, g in tree_flatten(grads)))
         print(f"Loss: {loss.item():.4f}")
+        print(f"Gradient L2 norm: {grad_norm:.6f}")
+        if grad_norm == 0.0:
+            raise RuntimeError("Gradient norm is exactly zero — nothing would train.")
         print(f"Forward + backward: {elapsed:.2f}s")
         print(f"Throughput: {len(queries) / elapsed:.1f} pairs/s")
-        print(f"Estimated epoch time: {steps_per_epoch * elapsed / 60:.1f} min")
-        print(f"Estimated total time: {total_steps * elapsed / 60:.1f} min")
+        print(f"Estimated epoch time: {micro_steps_per_epoch * elapsed / 60:.1f} min")
+        print(f"Estimated total time: {micro_steps_per_epoch * args.epochs * elapsed / 60:.1f} min")
         print("Dry run completed successfully.")
         return
 
@@ -343,10 +665,16 @@ def train(args):
     output_path.mkdir(parents=True, exist_ok=True)
 
     train_config = vars(args).copy()
-    train_config["total_steps"] = total_steps
-    train_config["warmup_steps"] = warmup_steps
-    train_config["trainable_params"] = trainable_params
-    train_config["total_params"] = total_params
+    train_config.update(
+        {
+            "total_steps": total_steps,
+            "warmup_steps": warmup_steps,
+            "trainable_params": trainable_params,
+            "total_params": total_params,
+            "embedding_dim": embed_dim,
+            "effective_batch_size": args.batch_size * args.grad_accum_steps,
+        }
+    )
     with open(output_path / "training_config.json", "w", encoding="utf-8") as f:
         json.dump(train_config, f, indent=2)
 
@@ -356,13 +684,14 @@ def train(args):
             "rank": args.lora_rank,
             "scale": args.lora_alpha / args.lora_rank,
             "dropout": args.lora_dropout,
-            "keys": DEFAULT_TARGET_MODULES,
+            "target_modules": args.target_modules,
         },
         "num_layers": -1,
     }
 
     global_step = 0
     best_eval_loss = float("inf")
+    best_step = None
     train_start = time.time()
     log_file = open(output_path / "training_log.jsonl", "w", encoding="utf-8")
 
@@ -377,28 +706,42 @@ def train(args):
         shuffled_pairs = train_pairs.copy()
         random.shuffle(shuffled_pairs)
 
-        for queries, positives in batch_pairs(shuffled_pairs, args.batch_size):
-            step_start = time.time()
-            q_tokens = tokenize_batch(tokenizer, queries, args.max_length)
-            p_tokens = tokenize_batch(tokenizer, positives, args.max_length)
+        accumulated = None
+        accum_count = 0
+        accum_loss = 0.0
+        step_start = time.time()
+        pairs_in_step = 0
 
+        for queries, positives, negatives in batch_pairs(shuffled_pairs, args.batch_size):
+            q_tokens, c_tokens, fn_mask = prepare_batch(queries, positives, negatives)
             loss, grads = loss_and_grad_fn(
                 model,
                 q_tokens["input_ids"], q_tokens["attention_mask"],
-                p_tokens["input_ids"], p_tokens["attention_mask"],
+                c_tokens["input_ids"], c_tokens["attention_mask"],
+                fn_mask,
             )
-            optimizer.update(model, grads)
-            mx.eval(model.parameters(), optimizer.state, loss)
+            accumulated = grads if accumulated is None else tree_map(mx.add, accumulated, grads)
+            accum_count += 1
+            accum_loss += loss.item()
+            pairs_in_step += len(queries)
+
+            if accum_count < args.grad_accum_steps:
+                continue
+
+            if args.grad_accum_steps > 1:
+                accumulated = tree_map(lambda g: g / args.grad_accum_steps, accumulated)
+            optimizer.update(model, accumulated)
+            mx.eval(model.parameters(), optimizer.state)
 
             step_time = time.time() - step_start
-            loss_val = loss.item()
+            loss_val = accum_loss / accum_count
             epoch_loss += loss_val
             epoch_steps += 1
             global_step += 1
+            accumulated, accum_count, accum_loss = None, 0, 0.0
 
             if global_step % args.log_every == 0 or global_step == 1:
-                throughput = len(queries) / step_time
-                current_lr = lr_schedule(global_step) if callable(lr_schedule) else args.learning_rate
+                current_lr = lr_schedule(global_step)
                 if hasattr(current_lr, "item"):
                     current_lr = current_lr.item()
                 entry = {
@@ -406,16 +749,16 @@ def train(args):
                     "epoch": epoch + 1,
                     "loss": round(loss_val, 4),
                     "lr": round(float(current_lr), 8),
-                    "throughput": round(throughput, 2),
+                    "throughput": round(pairs_in_step / step_time, 2),
                     "step_time": round(step_time, 2),
-                    "batch_size": len(queries),
+                    "effective_batch": pairs_in_step,
                 }
                 print(
                     f"Step {global_step:>5d}/{total_steps} | "
                     f"Epoch {epoch + 1}/{args.epochs} | "
                     f"Loss {loss_val:.4f} | "
                     f"LR {float(current_lr):.2e} | "
-                    f"{throughput:.2f} pairs/s | "
+                    f"{pairs_in_step / step_time:.2f} pairs/s | "
                     f"{step_time:.2f}s/step"
                 )
                 log_file.write(json.dumps(entry) + "\n")
@@ -424,17 +767,15 @@ def train(args):
             if args.eval_every > 0 and eval_pairs and global_step % args.eval_every == 0:
                 model.eval()
                 eval_loss = evaluate_loss(
-                    model,
-                    tokenizer,
-                    eval_pairs,
-                    args.batch_size,
-                    args.temperature,
-                    args.max_length,
+                    model, tokenizer, eval_pairs, args.batch_size,
+                    args.temperature, args.max_length, normalize, use_hard_negatives,
+                    args.query_prefix, args.doc_prefix, input_kwarg,
                 )
                 model.train()
                 is_best = eval_loss < best_eval_loss
                 if is_best:
                     best_eval_loss = eval_loss
+                    best_step = global_step
                 print(f"Evaluation at step {global_step}: loss={eval_loss:.4f}{' (new best)' if is_best else ''}")
                 log_file.write(json.dumps({"step": global_step, "eval_loss": round(eval_loss, 4), "is_best": is_best}) + "\n")
                 log_file.flush()
@@ -447,6 +788,19 @@ def train(args):
                     for item in ckpt_path.iterdir():
                         shutil.copy2(item, best_path / item.name)
                     print(f"Updated best checkpoint at {best_path}")
+                prune_checkpoints(args.output_dir, args.keep_checkpoints)
+
+            step_start = time.time()
+            pairs_in_step = 0
+
+        # Flush a partial accumulation window at the end of the epoch.
+        if accumulated is not None and accum_count > 0:
+            accumulated = tree_map(lambda g: g / accum_count, accumulated)
+            optimizer.update(model, accumulated)
+            mx.eval(model.parameters(), optimizer.state)
+            epoch_loss += accum_loss / accum_count
+            epoch_steps += 1
+            global_step += 1
 
         avg_epoch_loss = epoch_loss / max(epoch_steps, 1)
         print(f"Epoch {epoch + 1}/{args.epochs} complete | avg loss {avg_epoch_loss:.4f}")
@@ -457,11 +811,20 @@ def train(args):
     print("TRAINING COMPLETE")
     print("=" * 60)
     print(f"Total time: {total_time / 60:.1f} min")
-    if eval_pairs and best_eval_loss < float('inf'):
-        print(f"Best eval loss: {best_eval_loss:.4f}")
+
+    best_path = Path(args.output_dir) / "best"
+    if best_step is not None:
+        print(f"Best eval loss: {best_eval_loss:.4f} at step {best_step}")
+    if args.merge == "best" and best_path.exists():
+        print(f"Restoring best checkpoint (step {best_step}) before merge...")
+        load_lora_checkpoint(model, best_path)
+    elif args.merge == "best":
+        print("No best checkpoint recorded (no evaluation ran); merging final weights.")
+    else:
+        print("Merging final-step weights (--merge final).")
 
     print("\nMerging LoRA weights and saving final model...")
-    merge_and_save(model, args.model, args.output_dir)
+    merge_and_save(model, args.model, args.output_dir, args.query_prefix, args.doc_prefix)
     print("Done.")
 
 
@@ -471,10 +834,10 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python train.py \
-      --train-pairs example_data/train.jsonl \
-      --eval-pairs example_data/eval.jsonl \
-      --epochs 3 --batch-size 16
+  python train.py \\
+      --train-pairs example_data/train.jsonl \\
+      --eval-pairs example_data/eval.jsonl \\
+      --epochs 3 --batch-size 16 --grad-accum-steps 4
 
   python train.py --train-pairs example_data/train.jsonl --dry-run
         """,
@@ -483,7 +846,9 @@ Examples:
     parser.add_argument("--eval-pairs", default=None, help="Optional JSONL file with eval pairs")
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Model path or repository (default: {DEFAULT_MODEL})")
     parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
-    parser.add_argument("--batch-size", type=int, default=16, help="Batch size")
+    parser.add_argument("--batch-size", type=int, default=16, help="Micro-batch size (pairs per forward pass)")
+    parser.add_argument("--grad-accum-steps", type=int, default=1,
+                        help="Accumulate gradients over N micro-batches before an optimizer step")
     parser.add_argument("--learning-rate", type=float, default=2e-5, help="Peak learning rate")
     parser.add_argument("--weight-decay", type=float, default=0.01, help="Weight decay")
     parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE, help="Contrastive loss temperature")
@@ -491,9 +856,31 @@ Examples:
     parser.add_argument("--lora-rank", type=int, default=8, help="LoRA rank")
     parser.add_argument("--lora-alpha", type=float, default=16.0, help="LoRA alpha")
     parser.add_argument("--lora-dropout", type=float, default=0.0, help="LoRA dropout")
+    parser.add_argument("--target-modules", default="auto",
+                        help="Which linear modules to adapt: 'auto' (detect the architecture), "
+                             "'all-linear' (every linear inside a transformer block), a comma-separated "
+                             "list of module names (e.g. query,value), or regexes matched against "
+                             "module paths (e.g. 'attn\\.(Wqkv|Wo)$')")
+    parser.add_argument("--query-prefix", default="",
+                        help="Prefix prepended to every query, e.g. 'search_query: '. Current retrieval "
+                             "models (E5, BGE, nomic, Qwen3-Embedding, EmbeddingGemma) are pretrained with "
+                             "asymmetric prefixes; fine-tuning without them trains off-distribution.")
+    parser.add_argument("--doc-prefix", default="",
+                        help="Prefix prepended to every positive/negative document, e.g. 'search_document: '")
+    parser.add_argument("--no-hard-negatives", action="store_true",
+                        help="Ignore the `negatives` field and use in-batch negatives only")
+    parser.add_argument("--no-normalize", action="store_true",
+                        help="Skip explicit L2 normalization of embeddings (not recommended)")
+    parser.add_argument("--matryoshka-dims", default=None,
+                        help="Comma-separated nested dims for Matryoshka loss, e.g. 768,512,256,128,64")
+    parser.add_argument("--merge", choices=["best", "final"], default="best",
+                        help="Which adapter weights to fuse into the exported model (default: best)")
+    parser.add_argument("--keep-checkpoints", type=int, default=3,
+                        help="Number of numbered checkpoints to retain (0 = keep all)")
     parser.add_argument("--output-dir", default="outputs/mlx-embed-finetune", help="Output directory")
-    parser.add_argument("--log-every", type=int, default=10, help="Log every N training steps")
-    parser.add_argument("--eval-every", type=int, default=100, help="Run evaluation every N steps; 0 disables eval")
+    parser.add_argument("--log-every", type=int, default=10, help="Log every N optimizer steps")
+    parser.add_argument("--eval-every", type=int, default=100, help="Evaluate every N optimizer steps; 0 disables eval")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for shuffling and MLX")
     parser.add_argument("--dry-run", action="store_true", help="Load model and process one batch for speed estimates")
     return parser
 
@@ -501,6 +888,11 @@ Examples:
 def main():
     parser = build_parser()
     args = parser.parse_args()
+    if args.grad_accum_steps < 1:
+        parser.error("--grad-accum-steps must be >= 1")
+    if args.seed is not None:
+        random.seed(args.seed)
+        mx.random.seed(args.seed)
     train(args)
 
 

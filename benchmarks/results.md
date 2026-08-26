@@ -33,8 +33,76 @@ Notes:
 1. **Metal-native execution** through MLX instead of a weakly utilized PyTorch encoder path on Apple Silicon
 2. **Unified memory** reduces friction between compute and model state
 3. **LoRA fine-tuning** updates a tiny subset of parameters instead of the full encoder
-4. **In-batch negatives** give a strong contrastive signal without heavyweight mining pipelines
+4. **LoRA on Q/V only** keeps the backward pass narrow
 
 ## Practical Takeaway
 
 On the measured M1 Ultra setup, this reduced a multi-hour encoder fine-tuning workflow to under an hour while substantially increasing GPU utilization.
+
+
+## Verification, 2026-08-25
+
+Re-verified on the current stack after five months of upstream movement. No
+timing re-run was performed, so the M1 Ultra numbers above are unchanged and
+still date from the original BGE-M3 run.
+
+**Stack tested:** mlx 0.32.2 · mlx-lm 0.31.3 · mlx-embeddings 0.1.0 ·
+transformers 5.15.1 · Python 3.14 · macOS / Apple Silicon.
+
+**Result:** the pipeline still runs — but two silent failures were found and
+fixed, both of which produced a *confident-looking* run that trained nothing.
+
+| Finding | Symptom before the fix |
+|---|---|
+| `QuantizedLinear` is not a subclass of `nn.Linear` | Every projection in a 4/6/8-bit model was skipped. The script printed `Applied LoRA to 0 layers`, continued through optimizer setup, and died several steps later inside MLX with `[grad] Must specify at least one argument`. |
+| Zero adapted layers was not an error | The `0 layers` / `0.000M trainable` lines were printed as ordinary status output. Nothing in the pipeline treated "nothing to train" as a failure. |
+
+Both now raise `NoAdaptedLayersError` at the point of failure, naming the
+modules that *were* found. The dry run additionally asserts a non-zero gradient
+norm, and CI asserts that a bogus `--target-modules` exits non-zero.
+
+**Also corrected:** the merged export previously fused whatever weights the
+final step produced, even when an earlier checkpoint had a better eval loss,
+and the tokenizer file list omitted `vocab.txt` — so a merged BERT-family
+export shipped without its vocabulary.
+
+### Loss signal without hard negatives
+
+Measured on `mlx-community/all-MiniLM-L6-v2-bf16`, batch of 4, τ=0.05:
+embeddings arrive already L2-normalized, the diagonal logit is 20.0 and
+off-diagonal logits are ~3.8. Loss is **0.0001** and the gradient norm is
+**~4e-4**. That is not a bug — it is a well-trained encoder finding random
+in-batch negatives trivial, and it is the concrete reason explicit hard
+negatives were added.
+
+
+## Architecture coverage, 2026-08-25
+
+The original pipeline walked one hardcoded structure —
+`encoder.layer[*].attention.self.query|value` — which is the 2019 BERT block
+shape. Nothing released since fits it. Targeting is now done by matching module
+*paths*, with auto-detection across three families. Verified on this machine,
+each with a live non-zero gradient:
+
+| Model | Preset | Modules adapted | Trainable | Grad norm |
+|---|---|---:|---:|---:|
+| all-MiniLM-L6-v2-bf16 | `bert/xlm-roberta` | 12 | 0.074M | 4.3e-4 |
+| all-MiniLM-L6-v2-bf16, `all-linear` | — | 36 | 0.332M | 7.4e-4 |
+| nomicai-modernbert-embed-base-bf16 | `modernbert` | 44 | 0.811M | 8.6e-2 |
+| nomicai-modernbert-embed-base-4bit | `modernbert` (QLoRA) | 44 | 0.811M | 2.3e-1 |
+| embeddinggemma-300m-4bit | `decoder-style` (QLoRA) | 48 | 0.492M | 2.6e-1 |
+
+Two incompatibilities had to be handled, not one:
+
+1. **Block structure.** ModernBERT fuses QKV into a single `attn.Wqkv`
+   projection, so `--target-modules query,value` is not merely wrong there — it
+   is inexpressible.
+2. **Forward signature.** `mlx-embeddings` is not uniform: encoder models take
+   `input_ids`, decoder-style embedders take `inputs`. The model is inspected
+   once at load and the call adapted, rather than hardcoding one family's
+   convention.
+
+Adapting the same MiniLM with `all-linear` instead of Q/V-only triples the
+adapted module count and raises the gradient norm ~1.7x, consistent with the
+QLoRA paper's finding that low rank across all linear layers beats high rank
+across a couple.
