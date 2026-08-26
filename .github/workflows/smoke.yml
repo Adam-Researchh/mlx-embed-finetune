@@ -1,0 +1,100 @@
+name: smoke
+
+# The repository's whole failure mode is silent drift: MLX, mlx-lm and
+# mlx-embeddings move fast, and `LoRALinear` is imported from an internal
+# mlx-lm path. This job exists to notice breakage without a human running it.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, so upstream drift surfaces even when nobody touches the repo.
+    - cron: "0 14 * * 1"
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    # Apple Silicon runner — MLX requires Metal, it cannot run on x86 or Linux.
+    runs-on: macos-14
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Record resolved versions
+        run: pip list | grep -Ei "mlx|transformers|sentencepiece|numpy"
+
+      - name: Dry run — unquantized encoder (LoRA)
+        env:
+          HF_HUB_DISABLE_PROGRESS_BARS: "1"
+        run: |
+          python train.py \
+            --train-pairs example_data/train.jsonl \
+            --model mlx-community/all-MiniLM-L6-v2-bf16 \
+            --batch-size 4 --dry-run
+
+      - name: Dry run — quantized encoder (QLoRA)
+        env:
+          HF_HUB_DISABLE_PROGRESS_BARS: "1"
+        run: |
+          python train.py \
+            --train-pairs example_data/train.jsonl \
+            --model mlx-community/all-MiniLM-L6-v2-4bit \
+            --batch-size 4 --dry-run
+
+      - name: Dry run — Matryoshka loss
+        env:
+          HF_HUB_DISABLE_PROGRESS_BARS: "1"
+        run: |
+          python train.py \
+            --train-pairs example_data/train.jsonl \
+            --model mlx-community/all-MiniLM-L6-v2-bf16 \
+            --batch-size 4 --matryoshka-dims 384,256,128,64 --dry-run
+
+      - name: Full loop — train, evaluate, restore best, merge, export
+        env:
+          HF_HUB_DISABLE_PROGRESS_BARS: "1"
+        run: |
+          python train.py \
+            --train-pairs example_data/train.jsonl \
+            --eval-pairs example_data/eval.jsonl \
+            --model mlx-community/all-MiniLM-L6-v2-bf16 \
+            --epochs 2 --batch-size 4 --grad-accum-steps 2 \
+            --eval-every 3 --log-every 3 --keep-checkpoints 2 \
+            --seed 42 --output-dir /tmp/ci-out
+          test -f /tmp/ci-out/model.safetensors.index.json || test -f /tmp/ci-out/model.safetensors
+          test -f /tmp/ci-out/best/adapters.safetensors
+          test -f /tmp/ci-out/training_metadata.json
+
+      - name: Evaluate exported model against its base
+        env:
+          HF_HUB_DISABLE_PROGRESS_BARS: "1"
+        run: |
+          python evaluate.py \
+            --base-model mlx-community/all-MiniLM-L6-v2-bf16 \
+            --tuned-model /tmp/ci-out \
+            --eval-pairs example_data/eval.jsonl \
+            --json-out /tmp/ci-eval.json
+          test -f /tmp/ci-eval.json
+
+      - name: Guard — LoRA matching nothing must fail loudly
+        env:
+          HF_HUB_DISABLE_PROGRESS_BARS: "1"
+        run: |
+          if python train.py \
+              --train-pairs example_data/train.jsonl \
+              --model mlx-community/all-MiniLM-L6-v2-bf16 \
+              --target-modules does_not_exist --dry-run; then
+            echo "FAIL: zero adapted layers should be an error, not a silent no-op"
+            exit 1
+          fi
+          echo "OK: zero adapted layers raised as expected"

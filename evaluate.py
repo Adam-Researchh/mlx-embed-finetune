@@ -1,26 +1,33 @@
 #!/usr/bin/env python3
 """
-Compare a base encoder model against a fine-tuned encoder model on a simple
-query -> positive vs negative discrimination task.
+Compare a base encoder model against a fine-tuned encoder model on a retrieval
+style evaluation.
 
 Input data format (JSONL):
-    {"query": "...", "positive": "...", "negatives": ["..."]}
+    {"query": "...", "positive": "...", "negatives": ["...", "..."]}
 
-For each example, the script encodes the query, one relevant passage, and one
-irrelevant passage, then reports cosine-similarity margins for the base and
-fine-tuned models.
+Two views are reported:
+
+1. Pairwise discrimination — for each row, does the positive outrank its own
+   hard negatives? Reports accuracy and the mean positive-minus-negative
+   cosine margin.
+2. Corpus retrieval — every positive and every negative from the whole file is
+   pooled into one corpus, then each query is ranked against all of it.
+   Reports Recall@k and MRR@10. This is much closer to how an embedding model
+   is actually used than a two-document comparison, and it is where a
+   fine-tune that only memorized easy contrasts will show its weakness.
 """
 
 import argparse
 import json
-from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Sequence
 
 import mlx.core as mx
 from mlx_embeddings.tokenizer_utils import load_tokenizer
 from mlx_embeddings.utils import get_model_path, load_model
 
 DEFAULT_MAX_LENGTH = 512
+DEFAULT_RECALL_KS = (1, 3, 5, 10)
 
 
 def load_pairs(path: str) -> List[Dict]:
@@ -31,127 +38,227 @@ def load_pairs(path: str) -> List[Dict]:
             if not line:
                 continue
             item = json.loads(line)
-            if "query" not in item or "positive" not in item or not item.get("negatives"):
-                raise ValueError(f"Line {line_num} must include query, positive, and at least one negative")
+            if "query" not in item or "positive" not in item:
+                raise ValueError(f"Line {line_num} must include query and positive")
             pairs.append(item)
     return pairs
 
 
 def load_encoder(model_name: str):
     model_path = get_model_path(model_name)
-    model = load_model(model_path, lazy=False, path_to_repo=model_name)
+    model = load_model(model_path, lazy=False)
     tokenizer = load_tokenizer(model_path)
     return model, tokenizer
 
 
-def encode_texts(model, tokenizer, texts: List[str], max_length: int) -> mx.array:
-    encoded = tokenizer(
-        texts,
-        padding=True,
-        truncation=True,
-        max_length=max_length,
-        return_tensors="np",
-    )
-    output = model(
-        input_ids=mx.array(encoded["input_ids"]),
-        attention_mask=mx.array(encoded["attention_mask"]),
-    )
-    mx.eval(output.text_embeds)
-    return output.text_embeds
+def l2_normalize(x: mx.array, eps: float = 1e-12) -> mx.array:
+    return x / mx.maximum(mx.linalg.norm(x, axis=-1, keepdims=True), eps)
 
 
-def cosine_similarity(a: mx.array, b: mx.array) -> float:
-    sim = (a @ b.T).item()
-    return float(sim)
+def encode_texts(
+    model,
+    tokenizer,
+    texts: Sequence[str],
+    max_length: int,
+    batch_size: int = 32,
+    normalize: bool = True,
+) -> mx.array:
+    """Encode texts in batches and return a single stacked array.
+
+    Normalization is explicit so that a dot product IS cosine similarity, for
+    any encoder — including converted models that do not normalize their own
+    output.
+    """
+    chunks = []
+    for i in range(0, len(texts), batch_size):
+        window = list(texts[i : i + batch_size])
+        encoded = tokenizer(
+            window,
+            padding=True,
+            truncation=True,
+            max_length=max_length,
+            return_tensors="np",
+        )
+        output = model(
+            input_ids=mx.array(encoded["input_ids"]),
+            attention_mask=mx.array(encoded["attention_mask"]),
+        )
+        embeds = output.text_embeds
+        if normalize:
+            embeds = l2_normalize(embeds)
+        mx.eval(embeds)
+        chunks.append(embeds)
+    return mx.concatenate(chunks, axis=0) if len(chunks) > 1 else chunks[0]
 
 
-def score_example(model, tokenizer, item: Dict, max_length: int) -> Dict:
-    embeddings = encode_texts(
-        model,
-        tokenizer,
-        [item["query"], item["positive"], item["negatives"][0]],
-        max_length=max_length,
-    )
-    query = embeddings[0:1]
-    positive = embeddings[1:2]
-    negative = embeddings[2:3]
-    positive_score = cosine_similarity(query, positive)
-    negative_score = cosine_similarity(query, negative)
-    return {
-        "positive_score": positive_score,
-        "negative_score": negative_score,
-        "gap": positive_score - negative_score,
-        "correct": positive_score > negative_score,
-    }
-
-
-def evaluate_model(model_name: str, pairs: List[Dict], max_length: int) -> Dict:
-    model, tokenizer = load_encoder(model_name)
+def pairwise_scores(query_embeds: mx.array, pairs: List[Dict], corpus_index: Dict[str, int], corpus_embeds: mx.array) -> Dict:
+    correct = 0
+    total = 0
+    margins = []
     rows = []
-    for item in pairs:
-        result = score_example(model, tokenizer, item, max_length)
-        rows.append({
-            "query": item["query"],
-            **result,
-        })
-    avg_gap = sum(row["gap"] for row in rows) / len(rows)
-    accuracy = sum(1 for row in rows if row["correct"]) / len(rows)
+    for i, item in enumerate(pairs):
+        negatives = item.get("negatives") or []
+        if not negatives:
+            continue
+        q = query_embeds[i : i + 1]
+        pos = corpus_embeds[corpus_index[item["positive"]] : corpus_index[item["positive"]] + 1]
+        pos_score = float((q @ pos.T).item())
+        neg_scores = []
+        for neg in negatives:
+            n = corpus_embeds[corpus_index[neg] : corpus_index[neg] + 1]
+            neg_scores.append(float((q @ n.T).item()))
+        hardest = max(neg_scores)
+        is_correct = pos_score > hardest
+        correct += int(is_correct)
+        total += 1
+        margins.append(pos_score - hardest)
+        rows.append(
+            {
+                "query": item["query"],
+                "positive_score": round(pos_score, 4),
+                "hardest_negative_score": round(hardest, 4),
+                "margin": round(pos_score - hardest, 4),
+                "correct": is_correct,
+            }
+        )
     return {
-        "model": model_name,
-        "avg_gap": avg_gap,
-        "accuracy": accuracy,
+        "n": total,
+        "accuracy": (correct / total) if total else None,
+        "mean_margin": (sum(margins) / len(margins)) if margins else None,
         "rows": rows,
     }
 
 
-def print_report(base_result: Dict, tuned_result: Dict):
-    print("=" * 90)
-    print("EMBEDDING DISCRIMINATION EVALUATION")
-    print("=" * 90)
-    print(f"Base model:      {base_result['model']}")
-    print(f"Fine-tuned:      {tuned_result['model']}")
-    print(f"Base avg gap:    {base_result['avg_gap']:.4f}")
-    print(f"Tuned avg gap:   {tuned_result['avg_gap']:.4f}")
-    print(f"Gap improvement: {tuned_result['avg_gap'] - base_result['avg_gap']:+.4f}")
-    print(f"Base accuracy:   {base_result['accuracy'] * 100:.1f}%")
-    print(f"Tuned accuracy:  {tuned_result['accuracy'] * 100:.1f}%")
-    print()
-    print("Per-query results:")
-    print("-" * 90)
-    for base_row, tuned_row in zip(base_result["rows"], tuned_result["rows"]):
-        print(f"Query: {base_row['query']}")
-        print(
-            f"  base  -> pos {base_row['positive_score']:.4f} | neg {base_row['negative_score']:.4f} | gap {base_row['gap']:.4f}"
-        )
-        print(
-            f"  tuned -> pos {tuned_row['positive_score']:.4f} | neg {tuned_row['negative_score']:.4f} | gap {tuned_row['gap']:.4f}"
-        )
-        print()
+def retrieval_scores(
+    query_embeds: mx.array,
+    pairs: List[Dict],
+    corpus_index: Dict[str, int],
+    corpus_embeds: mx.array,
+    ks: Sequence[int] = DEFAULT_RECALL_KS,
+) -> Dict:
+    """Rank every query against the whole pooled corpus."""
+    sims = query_embeds @ corpus_embeds.T
+    mx.eval(sims)
+    order = mx.argsort(-sims, axis=1)
+    mx.eval(order)
+    order_list = order.tolist()
+
+    max_k = max(ks)
+    hits = {k: 0 for k in ks}
+    reciprocal_ranks = []
+    for i, item in enumerate(pairs):
+        gold = corpus_index[item["positive"]]
+        ranked = order_list[i]
+        try:
+            rank = ranked.index(gold) + 1
+        except ValueError:  # pragma: no cover - gold is always in corpus
+            rank = len(ranked) + 1
+        for k in ks:
+            if rank <= k:
+                hits[k] += 1
+        reciprocal_ranks.append(1.0 / rank if rank <= 10 else 0.0)
+
+    n = len(pairs)
+    return {
+        "n": n,
+        "corpus_size": corpus_embeds.shape[0],
+        "recall_at": {k: hits[k] / n for k in ks},
+        "mrr_at_10": sum(reciprocal_ranks) / n,
+        "max_k": max_k,
+    }
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Compare base and fine-tuned embedding models")
-    parser.add_argument("--base-model", required=True, help="Base model name or path")
-    parser.add_argument("--tuned-model", required=True, help="Fine-tuned model name or path")
-    parser.add_argument("--eval-pairs", required=True, help="JSONL file with eval examples")
-    parser.add_argument("--max-length", type=int, default=DEFAULT_MAX_LENGTH, help="Maximum token length")
-    parser.add_argument("--save-json", default=None, help="Optional path to save the full report as JSON")
-    return parser
+def evaluate_model(model_name: str, pairs: List[Dict], max_length: int, batch_size: int, normalize: bool) -> Dict:
+    model, tokenizer = load_encoder(model_name)
+
+    corpus_texts: List[str] = []
+    corpus_index: Dict[str, int] = {}
+    for item in pairs:
+        for text in [item["positive"], *(item.get("negatives") or [])]:
+            if text not in corpus_index:
+                corpus_index[text] = len(corpus_texts)
+                corpus_texts.append(text)
+
+    query_embeds = encode_texts(model, tokenizer, [p["query"] for p in pairs], max_length, batch_size, normalize)
+    corpus_embeds = encode_texts(model, tokenizer, corpus_texts, max_length, batch_size, normalize)
+
+    return {
+        "model": model_name,
+        "pairwise": pairwise_scores(query_embeds, pairs, corpus_index, corpus_embeds),
+        "retrieval": retrieval_scores(query_embeds, pairs, corpus_index, corpus_embeds),
+    }
+
+
+def fmt(value, digits=4):
+    return "n/a" if value is None else f"{value:.{digits}f}"
+
+
+def fmt_delta(new, old, digits=4):
+    if new is None or old is None:
+        return "n/a"
+    return f"{new - old:+.{digits}f}"
+
+
+def print_report(base: Dict, tuned: Dict, show_rows: bool) -> None:
+    print("\n" + "=" * 68)
+    print("RETRIEVAL (queries ranked against the full pooled corpus)")
+    print("=" * 68)
+    br, tr = base["retrieval"], tuned["retrieval"]
+    print(f"Queries: {br['n']}   Corpus documents: {br['corpus_size']}")
+    print(f"{'metric':<12}{'base':>12}{'tuned':>12}{'delta':>12}")
+    for k in sorted(br["recall_at"]):
+        b, t = br["recall_at"][k], tr["recall_at"][k]
+        print(f"{'recall@' + str(k):<12}{b:>12.4f}{t:>12.4f}{t - b:>+12.4f}")
+    print(f"{'mrr@10':<12}{br['mrr_at_10']:>12.4f}{tr['mrr_at_10']:>12.4f}{tr['mrr_at_10'] - br['mrr_at_10']:>+12.4f}")
+
+    print("\n" + "=" * 68)
+    print("PAIRWISE (positive vs its own hardest negative)")
+    print("=" * 68)
+    bp, tp = base["pairwise"], tuned["pairwise"]
+    if bp["n"] == 0:
+        print("No rows with negatives — pairwise view skipped.")
+    else:
+        print(f"Rows with negatives: {bp['n']}")
+        print(f"{'metric':<14}{'base':>12}{'tuned':>12}{'delta':>12}")
+        print(f"{'accuracy':<14}{fmt(bp['accuracy']):>12}{fmt(tp['accuracy']):>12}"
+              f"{fmt_delta(tp['accuracy'], bp['accuracy']):>12}")
+        print(f"{'mean margin':<14}{fmt(bp['mean_margin']):>12}{fmt(tp['mean_margin']):>12}"
+              f"{fmt_delta(tp['mean_margin'], bp['mean_margin']):>12}")
+
+    if show_rows and bp["n"]:
+        print("\nPer-query margins (base -> tuned):")
+        for b_row, t_row in zip(bp["rows"], tp["rows"]):
+            flag = "" if t_row["correct"] else "  <-- tuned incorrect"
+            print(f"  {b_row['query'][:52]:<54} {b_row['margin']:>+8.4f} -> {t_row['margin']:>+8.4f}{flag}")
 
 
 def main():
-    args = build_parser().parse_args()
-    pairs = load_pairs(args.eval_pairs)
-    base_result = evaluate_model(args.base_model, pairs, args.max_length)
-    tuned_result = evaluate_model(args.tuned_model, pairs, args.max_length)
-    print_report(base_result, tuned_result)
+    parser = argparse.ArgumentParser(description="Compare base vs fine-tuned MLX embedding models")
+    parser.add_argument("--base-model", required=True, help="Base model path or repository")
+    parser.add_argument("--tuned-model", required=True, help="Fine-tuned model directory")
+    parser.add_argument("--eval-pairs", required=True, help="JSONL evaluation file")
+    parser.add_argument("--max-length", type=int, default=DEFAULT_MAX_LENGTH, help="Maximum token length")
+    parser.add_argument("--batch-size", type=int, default=32, help="Encoding batch size")
+    parser.add_argument("--no-normalize", action="store_true", help="Skip explicit L2 normalization")
+    parser.add_argument("--show-rows", action="store_true", help="Print per-query detail")
+    parser.add_argument("--json-out", default=None, help="Optional path to write full results as JSON")
+    args = parser.parse_args()
 
-    if args.save_json:
-        payload = {"base": base_result, "tuned": tuned_result}
-        Path(args.save_json).parent.mkdir(parents=True, exist_ok=True)
-        with open(args.save_json, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
-        print(f"Saved JSON report to {args.save_json}")
+    pairs = load_pairs(args.eval_pairs)
+    normalize = not args.no_normalize
+    print(f"Loaded {len(pairs)} evaluation rows from {args.eval_pairs}")
+
+    print(f"\nEncoding with base model: {args.base_model}")
+    base = evaluate_model(args.base_model, pairs, args.max_length, args.batch_size, normalize)
+    print(f"Encoding with tuned model: {args.tuned_model}")
+    tuned = evaluate_model(args.tuned_model, pairs, args.max_length, args.batch_size, normalize)
+
+    print_report(base, tuned, args.show_rows)
+
+    if args.json_out:
+        with open(args.json_out, "w", encoding="utf-8") as f:
+            json.dump({"base": base, "tuned": tuned}, f, indent=2)
+        print(f"\nWrote full results to {args.json_out}")
 
 
 if __name__ == "__main__":
