@@ -51,6 +51,34 @@ jobs:
             --model mlx-community/all-MiniLM-L6-v2-4bit \
             --batch-size 4 --dry-run
 
+      - name: Dry run — ModernBERT (different block structure, fused QKV)
+        env:
+          HF_HUB_DISABLE_PROGRESS_BARS: "1"
+        run: |
+          python train.py \
+            --train-pairs example_data/train.jsonl \
+            --model mlx-community/nomicai-modernbert-embed-base-bf16 \
+            --batch-size 4 --dry-run
+
+      - name: Dry run — decoder-style embedder (different forward signature)
+        env:
+          HF_HUB_DISABLE_PROGRESS_BARS: "1"
+        run: |
+          python train.py \
+            --train-pairs example_data/train.jsonl \
+            --model mlx-community/embeddinggemma-300m-4bit \
+            --batch-size 2 --max-length 128 --dry-run
+
+      - name: Dry run — all-linear targeting and instruction prefixes
+        env:
+          HF_HUB_DISABLE_PROGRESS_BARS: "1"
+        run: |
+          python train.py \
+            --train-pairs example_data/train.jsonl \
+            --model mlx-community/all-MiniLM-L6-v2-bf16 \
+            --batch-size 4 --target-modules all-linear \
+            --query-prefix "search_query: " --doc-prefix "search_document: " --dry-run
+
       - name: Dry run — Matryoshka loss
         env:
           HF_HUB_DISABLE_PROGRESS_BARS: "1"
@@ -74,6 +102,12 @@ jobs:
           test -f /tmp/ci-out/model.safetensors.index.json || test -f /tmp/ci-out/model.safetensors
           test -f /tmp/ci-out/best/adapters.safetensors
           test -f /tmp/ci-out/training_metadata.json
+          python - <<'PY'
+          import json
+          meta = json.load(open("/tmp/ci-out/training_metadata.json"))
+          assert "query_prefix" in meta and "doc_prefix" in meta, meta
+          print("metadata records prefixes:", meta["query_prefix"], meta["doc_prefix"])
+          PY
 
       - name: Evaluate exported model against its base
         env:

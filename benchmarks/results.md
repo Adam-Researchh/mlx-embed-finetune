@@ -74,3 +74,35 @@ off-diagonal logits are ~3.8. Loss is **0.0001** and the gradient norm is
 **~4e-4**. That is not a bug — it is a well-trained encoder finding random
 in-batch negatives trivial, and it is the concrete reason explicit hard
 negatives were added.
+
+
+## Architecture coverage, 2026-08-25
+
+The original pipeline walked one hardcoded structure —
+`encoder.layer[*].attention.self.query|value` — which is the 2019 BERT block
+shape. Nothing released since fits it. Targeting is now done by matching module
+*paths*, with auto-detection across three families. Verified on this machine,
+each with a live non-zero gradient:
+
+| Model | Preset | Modules adapted | Trainable | Grad norm |
+|---|---|---:|---:|---:|
+| all-MiniLM-L6-v2-bf16 | `bert/xlm-roberta` | 12 | 0.074M | 4.3e-4 |
+| all-MiniLM-L6-v2-bf16, `all-linear` | — | 36 | 0.332M | 7.4e-4 |
+| nomicai-modernbert-embed-base-bf16 | `modernbert` | 44 | 0.811M | 8.6e-2 |
+| nomicai-modernbert-embed-base-4bit | `modernbert` (QLoRA) | 44 | 0.811M | 2.3e-1 |
+| embeddinggemma-300m-4bit | `decoder-style` (QLoRA) | 48 | 0.492M | 2.6e-1 |
+
+Two incompatibilities had to be handled, not one:
+
+1. **Block structure.** ModernBERT fuses QKV into a single `attn.Wqkv`
+   projection, so `--target-modules query,value` is not merely wrong there — it
+   is inexpressible.
+2. **Forward signature.** `mlx-embeddings` is not uniform: encoder models take
+   `input_ids`, decoder-style embedders take `inputs`. The model is inspected
+   once at load and the call adapted, rather than hardcoding one family's
+   convention.
+
+Adapting the same MiniLM with `all-linear` instead of Q/V-only triples the
+adapted module count and raises the gradient norm ~1.7x, consistent with the
+QLoRA paper's finding that low rank across all linear layers beats high rank
+across a couple.

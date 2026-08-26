@@ -26,9 +26,11 @@ and receives almost no gradient signal.
 """
 
 import argparse
+import inspect
 import json
 import math
 import random
+import re
 import shutil
 import time
 from pathlib import Path
@@ -51,6 +53,22 @@ DEFAULT_TARGET_MODULES = ["query", "value"]
 # so it must be named explicitly or every projection in a quantized model is
 # silently skipped. mlx_lm's LoRALinear.from_base handles both.
 ADAPTABLE_LINEAR_TYPES = (nn.Linear, nn.QuantizedLinear)
+
+# Attention-projection presets, tried in order when --target-modules is "auto".
+# Targeting is by module PATH, not by walking a fixed structure, because every
+# generation of encoder names its blocks differently: BERT/XLM-R use
+# encoder.layer[*].attention.self.query, ModernBERT uses layers[*].attn.Wqkv
+# (a FUSED qkv projection, so "query,value" is not even expressible there), and
+# decoder-style embedders use self_attn.q_proj / v_proj.
+ARCH_PRESETS = [
+    ("bert/xlm-roberta", [r"attention\.self\.(query|value)$"]),
+    ("modernbert",       [r"attn\.(Wqkv|Wo)$"]),
+    ("decoder-style",    [r"self_attn\.(q_proj|v_proj)$"]),
+]
+
+# Every linear layer in a transformer block. The QLoRA paper's finding is that
+# adapting all linear layers at low rank beats adapting a couple at high rank.
+ALL_LINEAR_PRESET = [r"(?:^|\.)(?:layers?|layer)\.\d+\..*$"]
 
 
 class NoAdaptedLayersError(RuntimeError):
@@ -95,64 +113,107 @@ def batch_pairs(pairs: List[Dict], batch_size: int):
         yield queries, positives, negatives
 
 
+def compile_target_patterns(spec: str) -> List[re.Pattern]:
+    """Turn a --target-modules spec into regexes.
+
+    A bare name like `query` is treated as a path suffix (a path-suffix match) so the
+    original CLI keeps working; anything containing regex metacharacters is used
+    as written.
+    """
+    patterns = []
+    for raw in spec.split(","):
+        token = raw.strip()
+        if not token:
+            continue
+        if re.search(r"[\\^$.|?*+()\[\]{}]", token):
+            patterns.append(re.compile(token))
+        else:
+            patterns.append(re.compile(rf"(?:^|\.){re.escape(token)}$"))
+    if not patterns:
+        raise ValueError("--target-modules resolved to no patterns")
+    return patterns
+
+
+def find_adaptable(model: nn.Module, patterns: Sequence[re.Pattern]) -> List[Tuple[str, nn.Module]]:
+    return [
+        (name, module)
+        for name, module in model.named_modules()
+        if name
+        and isinstance(module, ADAPTABLE_LINEAR_TYPES)
+        and any(p.search(name) for p in patterns)
+    ]
+
+
+def resolve_targets(model: nn.Module, spec: str) -> Tuple[str, List[Tuple[str, nn.Module]]]:
+    """Pick the module set to adapt, auto-detecting the architecture if asked."""
+    if spec == "all-linear":
+        patterns = [re.compile(p) for p in ALL_LINEAR_PRESET]
+        return "all-linear", find_adaptable(model, patterns)
+
+    if spec != "auto":
+        return spec, find_adaptable(model, compile_target_patterns(spec))
+
+    for preset_name, raw_patterns in ARCH_PRESETS:
+        patterns = [re.compile(p) for p in raw_patterns]
+        found = find_adaptable(model, patterns)
+        if found:
+            return f"auto:{preset_name}", found
+    return "auto", []
+
+
+def describe_linear_paths(model: nn.Module, limit: int = 12) -> List[str]:
+    paths = [
+        name
+        for name, module in model.named_modules()
+        if name and isinstance(module, ADAPTABLE_LINEAR_TYPES)
+    ]
+    return paths[:limit]
+
+
 def apply_lora_to_model(
     model: nn.Module,
     rank: int = 8,
     alpha: float = 16.0,
     dropout: float = 0.0,
-    target_modules: Optional[List[str]] = None,
+    target_spec: str = "auto",
 ) -> nn.Module:
-    if target_modules is None:
-        target_modules = DEFAULT_TARGET_MODULES
+    """Insert LoRA adapters by module path.
 
+    This deliberately makes no assumption about the model's block structure —
+    it walks every module, matches paths, and replaces what it finds. That is
+    what lets one script cover BERT, XLM-RoBERTa, ModernBERT and decoder-style
+    embedders instead of only the architecture it was written against.
+    """
     scale = alpha / rank
-    adapted = 0
-    seen_module_names = set()
-    skipped_types = {}
+    resolved_spec, targets = resolve_targets(model, target_spec)
 
-    if not hasattr(model, "encoder") or not hasattr(model.encoder, "layer"):
-        raise NoAdaptedLayersError(
-            "Model has no `.encoder.layer` stack. This pipeline targets encoder "
-            "architectures (BERT / XLM-RoBERTa family). Top-level modules found: "
-            f"{[name for name, _ in model.named_modules() if name and '.' not in name]}"
-        )
-
-    for layer in model.encoder.layer:
-        attention = layer.attention.self
-        replacements = []
-        for module_name in target_modules:
-            if not hasattr(attention, module_name):
-                continue
-            original_linear = getattr(attention, module_name)
-            seen_module_names.add(module_name)
-            if isinstance(original_linear, ADAPTABLE_LINEAR_TYPES):
-                replacements.append(
-                    (
-                        module_name,
-                        LoRALinear.from_base(
-                            original_linear,
-                            r=rank,
-                            dropout=dropout,
-                            scale=scale,
-                        ),
-                    )
-                )
-                adapted += 1
-            else:
-                skipped_types[module_name] = type(original_linear).__name__
-        if replacements:
-            attention.update_modules(tree_unflatten(replacements))
-
-    if adapted == 0:
+    if not targets:
         raise NoAdaptedLayersError(
             "LoRA adapted 0 layers, so there would be nothing to train.\n"
-            f"  requested target modules: {target_modules}\n"
-            f"  attention submodules found: {sorted(seen_module_names) or 'none'}\n"
-            f"  found-but-unsupported types: {skipped_types or 'none'}\n"
-            "Pass --target-modules with names that exist on this architecture."
+            f"  --target-modules: {target_spec} (resolved as {resolved_spec})\n"
+            f"  adaptable linear paths in this model (first {len(describe_linear_paths(model))}):\n"
+            + "".join(f"    {p}\n" for p in describe_linear_paths(model))
+            + "  Pass --target-modules with a name or regex matching those paths, "
+            "or --target-modules all-linear."
         )
 
-    print(f"Applied LoRA to {adapted} layers (rank={rank}, alpha={alpha}, scale={scale:.2f})")
+    model.update_modules(
+        tree_unflatten(
+            [
+                (
+                    name,
+                    LoRALinear.from_base(module, r=rank, dropout=dropout, scale=scale),
+                )
+                for name, module in targets
+            ]
+        )
+    )
+
+    quantized = sum(1 for _, m in targets if isinstance(m, nn.QuantizedLinear))
+    suffix = f", {quantized} quantized (QLoRA)" if quantized else ""
+    print(f"Applied LoRA to {len(targets)} modules via {resolved_spec} "
+          f"(rank={rank}, alpha={alpha}, scale={scale:.2f}{suffix})")
+    print(f"  e.g. {targets[0][0]}")
     return model
 
 
@@ -190,6 +251,40 @@ def tokenize_batch(tokenizer, texts: List[str], max_length: int = DEFAULT_MAX_LE
     }
 
 
+def detect_input_kwarg(model: nn.Module) -> str:
+    """Find whether this model's forward takes `input_ids` or `inputs`.
+
+    mlx-embeddings is not uniform here: encoder models (bert, xlm_roberta,
+    modernbert) take `input_ids`, while decoder-style embedders (gemma3_text,
+    qwen3) take `inputs`. Detecting once at load time keeps one training loop
+    working across both instead of hardcoding one family's convention.
+    """
+    try:
+        params = inspect.signature(model.__call__).parameters
+    except (TypeError, ValueError):
+        return "input_ids"
+    for candidate in ("input_ids", "inputs", "input_tokens"):
+        if candidate in params:
+            return candidate
+    raise TypeError(
+        "Could not find a token-input argument on this model's forward pass; "
+        f"signature is {inspect.signature(model.__call__)}"
+    )
+
+
+def apply_prefix(texts: Sequence[str], prefix: str) -> List[str]:
+    """Prepend an instruction prefix, if one is configured.
+
+    Asymmetric query/document prefixes are how modern retrieval encoders were
+    pretrained. Training without the prefix a model expects moves it off its
+    own distribution, and inference must use the same prefixes -- so they are
+    recorded in the exported metadata.
+    """
+    if not prefix:
+        return list(texts)
+    return [prefix + t for t in texts]
+
+
 def l2_normalize(x: mx.array, eps: float = 1e-12) -> mx.array:
     return x / mx.maximum(mx.linalg.norm(x, axis=-1, keepdims=True), eps)
 
@@ -199,6 +294,7 @@ def encode_texts(
     input_ids: mx.array,
     attention_mask: mx.array,
     normalize: bool = True,
+    input_kwarg: str = "input_ids",
 ) -> mx.array:
     """Encode a batch of texts.
 
@@ -208,7 +304,7 @@ def encode_texts(
     on unit vectors, and a converted encoder that does not normalize would
     otherwise train on saturated logits without any error being raised.
     """
-    output = model(input_ids=input_ids, attention_mask=attention_mask)
+    output = model(**{input_kwarg: input_ids}, attention_mask=attention_mask)
     embeds = output.text_embeds
     return l2_normalize(embeds) if normalize else embeds
 
@@ -293,17 +389,20 @@ def evaluate_loss(
     max_length: int,
     normalize: bool,
     use_hard_negatives: bool,
+    query_prefix: str = "",
+    doc_prefix: str = "",
+    input_kwarg: str = "input_ids",
 ) -> float:
     total_loss = 0.0
     num_batches = 0
     for queries, positives, negatives in batch_pairs(eval_pairs, batch_size):
         if not use_hard_negatives:
             negatives = []
-        q_tokens = tokenize_batch(tokenizer, queries, max_length)
-        c_texts = positives + negatives
+        q_tokens = tokenize_batch(tokenizer, apply_prefix(queries, query_prefix), max_length)
+        c_texts = apply_prefix(positives + negatives, doc_prefix)
         c_tokens = tokenize_batch(tokenizer, c_texts, max_length)
-        q_embeds = encode_texts(model, q_tokens["input_ids"], q_tokens["attention_mask"], normalize)
-        c_embeds = encode_texts(model, c_tokens["input_ids"], c_tokens["attention_mask"], normalize)
+        q_embeds = encode_texts(model, q_tokens["input_ids"], q_tokens["attention_mask"], normalize, input_kwarg)
+        c_embeds = encode_texts(model, c_tokens["input_ids"], c_tokens["attention_mask"], normalize, input_kwarg)
         mask = build_false_negative_mask(positives, negatives)
         loss = info_nce_loss(q_embeds, c_embeds, temperature, mask)
         mx.eval(loss)
@@ -353,7 +452,8 @@ def load_lora_checkpoint(model: nn.Module, ckpt_dir: Path) -> nn.Module:
     return model
 
 
-def merge_and_save(model: nn.Module, model_name: str, output_dir: str) -> Path:
+def merge_and_save(model: nn.Module, model_name: str, output_dir: str,
+                   query_prefix: str = "", doc_prefix: str = "") -> Path:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -399,6 +499,13 @@ def merge_and_save(model: nn.Module, model_name: str, output_dir: str) -> Path:
         "framework": "mlx",
         "fused_layers": fused_count,
         "dequantized_on_merge": dequantized,
+        "query_prefix": query_prefix,
+        "doc_prefix": doc_prefix,
+        "prefix_note": (
+            "Inference MUST use the same prefixes these weights were trained with."
+            if (query_prefix or doc_prefix)
+            else "Trained without instruction prefixes."
+        ),
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "notes": "Merged LoRA adapter weights for encoder fine-tuning.",
     }
@@ -426,6 +533,9 @@ def train(args):
     print(f"Temperature:      {args.temperature}")
     print(f"Max length:       {args.max_length}")
     print(f"Hard negatives:   {not args.no_hard_negatives}")
+    print(f"Query prefix:     {args.query_prefix!r}")
+    print(f"Doc prefix:       {args.doc_prefix!r}")
+    print(f"Target modules:   {args.target_modules}")
     print(f"Normalize embeds: {not args.no_normalize}")
     print(f"Matryoshka dims:  {args.matryoshka_dims or 'disabled'}")
     print(f"Output:           {args.output_dir}")
@@ -444,9 +554,13 @@ def train(args):
     tokenizer = load_tokenizer(model_path)
     print(f"Loaded in {time.time() - t0:.1f}s")
 
+    input_kwarg = detect_input_kwarg(model)
+    if input_kwarg != "input_ids":
+        print(f"Model forward takes `{input_kwarg}` rather than `input_ids`; adapting call.")
+
     probe = tokenizer(["test"], return_tensors="np", padding=True)
     probe_out = model(
-        input_ids=mx.array(probe["input_ids"]),
+        **{input_kwarg: mx.array(probe["input_ids"])},
         attention_mask=mx.array(probe["attention_mask"]),
     )
     mx.eval(probe_out.text_embeds)
@@ -462,7 +576,7 @@ def train(args):
         rank=args.lora_rank,
         alpha=args.lora_alpha,
         dropout=args.lora_dropout,
-        target_modules=[m.strip() for m in args.target_modules.split(",")],
+        target_spec=args.target_modules,
     )
     model = freeze_base_and_enable_lora(model)
     total_params, trainable_params = count_parameters(model)
@@ -497,8 +611,8 @@ def train(args):
     print(f"LR schedule: linear warmup ({warmup_steps} steps) -> cosine decay")
 
     def loss_fn(model, q_ids, q_mask, c_ids, c_mask, fn_mask):
-        q_embeds = encode_texts(model, q_ids, q_mask, normalize)
-        c_embeds = encode_texts(model, c_ids, c_mask, normalize)
+        q_embeds = encode_texts(model, q_ids, q_mask, normalize, input_kwarg)
+        c_embeds = encode_texts(model, c_ids, c_mask, normalize, input_kwarg)
         if matryoshka_dims:
             return matryoshka_loss(q_embeds, c_embeds, matryoshka_dims, args.temperature, fn_mask)
         return info_nce_loss(q_embeds, c_embeds, args.temperature, fn_mask)
@@ -508,8 +622,10 @@ def train(args):
     def prepare_batch(queries, positives, negatives):
         if not use_hard_negatives:
             negatives = []
-        q_tokens = tokenize_batch(tokenizer, queries, args.max_length)
-        c_tokens = tokenize_batch(tokenizer, positives + negatives, args.max_length)
+        q_tokens = tokenize_batch(tokenizer, apply_prefix(queries, args.query_prefix), args.max_length)
+        c_tokens = tokenize_batch(
+            tokenizer, apply_prefix(positives + negatives, args.doc_prefix), args.max_length
+        )
         fn_mask = build_false_negative_mask(positives, negatives)
         return q_tokens, c_tokens, fn_mask
 
@@ -568,7 +684,7 @@ def train(args):
             "rank": args.lora_rank,
             "scale": args.lora_alpha / args.lora_rank,
             "dropout": args.lora_dropout,
-            "keys": [m.strip() for m in args.target_modules.split(",")],
+            "target_modules": args.target_modules,
         },
         "num_layers": -1,
     }
@@ -653,6 +769,7 @@ def train(args):
                 eval_loss = evaluate_loss(
                     model, tokenizer, eval_pairs, args.batch_size,
                     args.temperature, args.max_length, normalize, use_hard_negatives,
+                    args.query_prefix, args.doc_prefix, input_kwarg,
                 )
                 model.train()
                 is_best = eval_loss < best_eval_loss
@@ -707,7 +824,7 @@ def train(args):
         print("Merging final-step weights (--merge final).")
 
     print("\nMerging LoRA weights and saving final model...")
-    merge_and_save(model, args.model, args.output_dir)
+    merge_and_save(model, args.model, args.output_dir, args.query_prefix, args.doc_prefix)
     print("Done.")
 
 
@@ -739,8 +856,17 @@ Examples:
     parser.add_argument("--lora-rank", type=int, default=8, help="LoRA rank")
     parser.add_argument("--lora-alpha", type=float, default=16.0, help="LoRA alpha")
     parser.add_argument("--lora-dropout", type=float, default=0.0, help="LoRA dropout")
-    parser.add_argument("--target-modules", default=",".join(DEFAULT_TARGET_MODULES),
-                        help="Comma-separated attention submodules to adapt (default: query,value)")
+    parser.add_argument("--target-modules", default="auto",
+                        help="Which linear modules to adapt: 'auto' (detect the architecture), "
+                             "'all-linear' (every linear inside a transformer block), a comma-separated "
+                             "list of module names (e.g. query,value), or regexes matched against "
+                             "module paths (e.g. 'attn\\.(Wqkv|Wo)$')")
+    parser.add_argument("--query-prefix", default="",
+                        help="Prefix prepended to every query, e.g. 'search_query: '. Current retrieval "
+                             "models (E5, BGE, nomic, Qwen3-Embedding, EmbeddingGemma) are pretrained with "
+                             "asymmetric prefixes; fine-tuning without them trains off-distribution.")
+    parser.add_argument("--doc-prefix", default="",
+                        help="Prefix prepended to every positive/negative document, e.g. 'search_document: '")
     parser.add_argument("--no-hard-negatives", action="store_true",
                         help="Ignore the `negatives` field and use in-batch negatives only")
     parser.add_argument("--no-normalize", action="store_true",

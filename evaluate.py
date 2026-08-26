@@ -19,7 +19,9 @@ Two views are reported:
 """
 
 import argparse
+import inspect
 import json
+from pathlib import Path
 from typing import Dict, List, Sequence
 
 import mlx.core as mx
@@ -51,6 +53,39 @@ def load_encoder(model_name: str):
     return model, tokenizer
 
 
+def detect_input_kwarg(model) -> str:
+    """Encoder models take `input_ids`; decoder-style embedders take `inputs`."""
+    try:
+        params = inspect.signature(model.__call__).parameters
+    except (TypeError, ValueError):
+        return "input_ids"
+    for candidate in ("input_ids", "inputs", "input_tokens"):
+        if candidate in params:
+            return candidate
+    return "input_ids"
+
+
+def apply_prefix(texts: Sequence[str], prefix: str) -> List[str]:
+    """Prepend an instruction prefix. Must match what the model was trained with."""
+    if not prefix:
+        return list(texts)
+    return [prefix + t for t in texts]
+
+
+def read_trained_prefixes(model_dir: str):
+    """Recover the prefixes a fine-tuned export was trained with, if recorded."""
+    meta = Path(model_dir) / "training_metadata.json"
+    if not meta.exists():
+        return None
+    try:
+        data = json.loads(meta.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if "query_prefix" not in data and "doc_prefix" not in data:
+        return None
+    return data.get("query_prefix", ""), data.get("doc_prefix", "")
+
+
 def l2_normalize(x: mx.array, eps: float = 1e-12) -> mx.array:
     return x / mx.maximum(mx.linalg.norm(x, axis=-1, keepdims=True), eps)
 
@@ -62,6 +97,7 @@ def encode_texts(
     max_length: int,
     batch_size: int = 32,
     normalize: bool = True,
+    input_kwarg: str = "input_ids",
 ) -> mx.array:
     """Encode texts in batches and return a single stacked array.
 
@@ -80,7 +116,7 @@ def encode_texts(
             return_tensors="np",
         )
         output = model(
-            input_ids=mx.array(encoded["input_ids"]),
+            **{input_kwarg: mx.array(encoded["input_ids"])},
             attention_mask=mx.array(encoded["attention_mask"]),
         )
         embeds = output.text_embeds
@@ -168,8 +204,10 @@ def retrieval_scores(
     }
 
 
-def evaluate_model(model_name: str, pairs: List[Dict], max_length: int, batch_size: int, normalize: bool) -> Dict:
+def evaluate_model(model_name: str, pairs: List[Dict], max_length: int, batch_size: int,
+                   normalize: bool, query_prefix: str = "", doc_prefix: str = "") -> Dict:
     model, tokenizer = load_encoder(model_name)
+    input_kwarg = detect_input_kwarg(model)
 
     corpus_texts: List[str] = []
     corpus_index: Dict[str, int] = {}
@@ -179,11 +217,19 @@ def evaluate_model(model_name: str, pairs: List[Dict], max_length: int, batch_si
                 corpus_index[text] = len(corpus_texts)
                 corpus_texts.append(text)
 
-    query_embeds = encode_texts(model, tokenizer, [p["query"] for p in pairs], max_length, batch_size, normalize)
-    corpus_embeds = encode_texts(model, tokenizer, corpus_texts, max_length, batch_size, normalize)
+    query_embeds = encode_texts(
+        model, tokenizer, apply_prefix([p["query"] for p in pairs], query_prefix),
+        max_length, batch_size, normalize, input_kwarg,
+    )
+    corpus_embeds = encode_texts(
+        model, tokenizer, apply_prefix(corpus_texts, doc_prefix),
+        max_length, batch_size, normalize, input_kwarg,
+    )
 
     return {
         "model": model_name,
+        "query_prefix": query_prefix,
+        "doc_prefix": doc_prefix,
         "pairwise": pairwise_scores(query_embeds, pairs, corpus_index, corpus_embeds),
         "retrieval": retrieval_scores(query_embeds, pairs, corpus_index, corpus_embeds),
     }
@@ -240,6 +286,10 @@ def main():
     parser.add_argument("--max-length", type=int, default=DEFAULT_MAX_LENGTH, help="Maximum token length")
     parser.add_argument("--batch-size", type=int, default=32, help="Encoding batch size")
     parser.add_argument("--no-normalize", action="store_true", help="Skip explicit L2 normalization")
+    parser.add_argument("--query-prefix", default=None,
+                        help="Query instruction prefix. Defaults to whatever the tuned model's "
+                             "training_metadata.json recorded, so evaluation matches training.")
+    parser.add_argument("--doc-prefix", default=None, help="Document instruction prefix")
     parser.add_argument("--show-rows", action="store_true", help="Print per-query detail")
     parser.add_argument("--json-out", default=None, help="Optional path to write full results as JSON")
     args = parser.parse_args()
@@ -248,10 +298,27 @@ def main():
     normalize = not args.no_normalize
     print(f"Loaded {len(pairs)} evaluation rows from {args.eval_pairs}")
 
+    query_prefix, doc_prefix = args.query_prefix, args.doc_prefix
+    if query_prefix is None or doc_prefix is None:
+        recorded = read_trained_prefixes(args.tuned_model)
+        if recorded:
+            if query_prefix is None:
+                query_prefix = recorded[0]
+            if doc_prefix is None:
+                doc_prefix = recorded[1]
+            print(f"Using prefixes recorded by the tuned model: "
+                  f"query={query_prefix!r} doc={doc_prefix!r}")
+    query_prefix = query_prefix or ""
+    doc_prefix = doc_prefix or ""
+    if query_prefix or doc_prefix:
+        print("Both models are scored with the same prefixes, so the comparison stays fair.")
+
     print(f"\nEncoding with base model: {args.base_model}")
-    base = evaluate_model(args.base_model, pairs, args.max_length, args.batch_size, normalize)
+    base = evaluate_model(args.base_model, pairs, args.max_length, args.batch_size, normalize,
+                          query_prefix, doc_prefix)
     print(f"Encoding with tuned model: {args.tuned_model}")
-    tuned = evaluate_model(args.tuned_model, pairs, args.max_length, args.batch_size, normalize)
+    tuned = evaluate_model(args.tuned_model, pairs, args.max_length, args.batch_size, normalize,
+                           query_prefix, doc_prefix)
 
     print_report(base, tuned, args.show_rows)
 

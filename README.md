@@ -1,10 +1,11 @@
 # mlx-embed-finetune
 
-Fine-tune **encoder** embedding models with LoRA on Apple Silicon using MLX.
+Fine-tune embedding models with LoRA on Apple Silicon using MLX.
 
-`mlx-lm` is excellent for decoder-style language models. This project targets
-**encoders** — BERT, XLM-RoBERTa, BGE — for retrieval and semantic search, in a
-single readable training script you can fork rather than a framework you adopt.
+`mlx-lm` is excellent for decoder-style *language* models. This project targets
+**embedding** models for retrieval and semantic search — BERT, XLM-RoBERTa,
+ModernBERT, and decoder-style embedders like EmbeddingGemma — in a single
+readable training script you can fork rather than a framework you adopt.
 
 ## Prior art — read this before choosing a tool
 
@@ -42,8 +43,16 @@ kind of pipeline silently trains nothing.
 
 ## Features
 
-- LoRA adapters on attention Q/V projections, on **fp16/bf16 and quantized
-  (QLoRA)** base models
+- **Architecture-agnostic LoRA targeting.** Adapters are placed by matching
+  module *paths*, not by walking one hardcoded block structure, so BERT
+  (`attention.self.query`), ModernBERT (`attn.Wqkv` — a fused QKV projection)
+  and decoder-style embedders (`self_attn.q_proj`) all work from one script.
+  `--target-modules auto` detects the family; `all-linear` adapts every linear
+  in a block; explicit names and regexes both still work.
+- **Instruction prefixes** (`--query-prefix` / `--doc-prefix`) for models
+  pretrained with asymmetric query/document prompts, recorded in the export so
+  inference can match training
+- Works on **fp16/bf16 and quantized (QLoRA)** base models
 - **InfoNCE / MultipleNegativesRankingLoss** with **explicit hard negatives**
   pooled across the batch, not just in-batch negatives
 - **False-negative masking** — candidates that duplicate a row's own positive
@@ -93,7 +102,8 @@ python train.py \
 |---|---|---|
 | `--batch-size` | 16 | Micro-batch: queries per forward pass |
 | `--grad-accum-steps` | 1 | Effective batch = batch-size × this |
-| `--target-modules` | `query,value` | Attention submodules to adapt |
+| `--target-modules` | `auto` | `auto`, `all-linear`, names (`query,value`), or regexes |
+| `--query-prefix` / `--doc-prefix` | empty | Instruction prefixes |
 | `--no-hard-negatives` | off | Ignore `negatives`, in-batch only |
 | `--matryoshka-dims` | off | e.g. `1024,512,256,128,64` |
 | `--merge` | `best` | `best` or `final` adapter weights for export |
@@ -124,14 +134,36 @@ For a real benchmark, point this at your own retrieval set, or use
 
 ## Supported models
 
-- `BAAI/bge-m3` via `mlx-community/bge-m3-mlx-fp16` (the model this was built
-  for) and its 4/6/8-bit variants
-- Any MLX-converted BERT / XLM-RoBERTa encoder from `mlx-community` whose
-  attention submodules are named `query` / `value` — otherwise pass
-  `--target-modules`
+Anything `mlx-embeddings` can load, in fp16/bf16 or quantized. Verified end to
+end:
 
-Smoke-tested on `mlx-community/all-MiniLM-L6-v2-bf16` and
-`mlx-community/all-MiniLM-L6-v2-4bit`.
+| Model | Family | Auto-detected as | Modules adapted |
+|---|---|---|---|
+| `mlx-community/all-MiniLM-L6-v2-bf16` / `-4bit` | BERT | `bert/xlm-roberta` | 12 |
+| `mlx-community/nomicai-modernbert-embed-base-bf16` / `-4bit` | ModernBERT | `modernbert` | 44 |
+| `mlx-community/embeddinggemma-300m-4bit` | Gemma 3 | `decoder-style` | 48 |
+| `mlx-community/bge-m3-mlx-fp16` | XLM-RoBERTa | `bert/xlm-roberta` | 48 |
+
+Two things vary across these families and are handled automatically: the block
+structure (matched by path) and the forward signature — encoder models take
+`input_ids`, decoder-style embedders take `inputs`, and the model is inspected
+once at load to work out which.
+
+### Instruction prefixes matter
+
+nomic-embed, E5, BGE, Qwen3-Embedding and EmbeddingGemma are all pretrained
+with asymmetric prompts. Fine-tuning without them trains the model off its own
+distribution:
+
+```bash
+python train.py ... \
+  --model mlx-community/nomicai-modernbert-embed-base-bf16 \
+  --query-prefix "search_query: " \
+  --doc-prefix "search_document: "
+```
+
+The prefixes are written into `training_metadata.json`, and `evaluate.py` reads
+them back automatically so evaluation matches training.
 
 ## Benchmarks
 
@@ -149,8 +181,11 @@ to demonstrate that fine-tuning helped.
 
 ## Caveats
 
-- Targets encoder architectures with an `encoder.layer[*].attention.self`
-  stack. Anything else raises immediately with the module names it did find.
+- If targeting matches nothing, it raises immediately and prints the adaptable
+  module paths it *did* find, rather than training zero parameters.
+- The three auto-detect presets cover the families listed above. Anything else
+  needs an explicit `--target-modules` regex — which is a one-flag change, not
+  a code change.
 - `LoRALinear` is imported from `mlx_lm.tuner.lora`, an internal path in
   mlx-lm. Verified on mlx-lm 0.29.1 and 0.31.3; the CI smoke test is there to
   catch the day it moves.
