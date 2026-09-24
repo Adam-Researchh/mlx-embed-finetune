@@ -13,22 +13,35 @@ on:
   workflow_dispatch:
 
 jobs:
+  retrieval-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.12"
+      - run: pip install numpy pytest
+      - run: python -m pytest -q tests/test_retrieval.py tests/test_mining.py tests/test_benchmark.py
+
   smoke:
-    # Apple Silicon runner — MLX requires Metal, it cannot run on x86 or Linux.
+    # Apple Silicon runner for the Metal training and export integration tests.
     runs-on: macos-14
     timeout-minutes: 25
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7.0.0
         with:
           python-version: "3.12"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements.txt pytest
+
+      - name: Regression tests
+        run: python -m pytest -q
 
       - name: Record resolved versions
         run: pip list | grep -Ei "mlx|transformers|sentencepiece|numpy"
@@ -98,6 +111,7 @@ jobs:
             --model mlx-community/all-MiniLM-L6-v2-bf16 \
             --epochs 2 --batch-size 4 --grad-accum-steps 2 \
             --eval-every 3 --log-every 3 --keep-checkpoints 2 \
+            --best-metric ndcg_at_10 --hardness-strength 2 \
             --seed 42 --output-dir /tmp/ci-out
           test -f /tmp/ci-out/model.safetensors.index.json || test -f /tmp/ci-out/model.safetensors
           test -f /tmp/ci-out/best/adapters.safetensors
@@ -117,8 +131,25 @@ jobs:
             --base-model mlx-community/all-MiniLM-L6-v2-bf16 \
             --tuned-model /tmp/ci-out \
             --eval-pairs example_data/eval.jsonl \
-            --json-out /tmp/ci-eval.json
+            --dims 128,64 --json-out /tmp/ci-eval.json
           test -f /tmp/ci-eval.json
+
+      - name: Export parity — bf16 and QLoRA
+        env:
+          RUN_MODEL_TESTS: "1"
+        run: python -m pytest -q tests/test_export.py
+
+      - name: Mine negatives with an embedding teacher
+        run: |
+          python mine.py \
+            --train-pairs example_data/train.jsonl \
+            --model mlx-community/all-MiniLM-L6-v2-bf16 \
+            --guide-model mlx-community/all-MiniLM-L6-v2-4bit \
+            --num-negatives 3 --range-max 20 --output /tmp/ci-mined.jsonl
+          python train.py \
+            --train-pairs /tmp/ci-mined.jsonl \
+            --model mlx-community/all-MiniLM-L6-v2-4bit \
+            --batch-size 4 --hardness-strength 2 --dry-run
 
       - name: Guard — LoRA matching nothing must fail loudly
         env:

@@ -10,7 +10,7 @@ Features:
 - InfoNCE / MultipleNegativesRankingLoss with optional explicit hard negatives
 - False-negative masking for duplicate positives inside a batch
 - Optional Matryoshka (MRL) multi-dimension loss
-- Gradient accumulation for a larger effective batch (more in-batch negatives)
+- Gradient accumulation for larger optimizer batches (same negative pool per micro-batch)
 - Decoupled weight-decay optimizer with warmup + cosine decay
 - Periodic evaluation, best-checkpoint tracking, and best-checkpoint export
 - LoRA checkpoint export and merged model export
@@ -44,6 +44,8 @@ from mlx_embeddings.tokenizer_utils import load_tokenizer
 from mlx_embeddings.utils import get_model_path, load_model
 from mlx_lm.tuner.lora import LoRALinear
 
+from retrieval import file_digest, known_positives, load_corpus, load_pairs
+
 DEFAULT_MODEL = "mlx-community/bge-m3-mlx-fp16"
 DEFAULT_TEMPERATURE = 0.05
 DEFAULT_MAX_LENGTH = 512
@@ -73,25 +75,6 @@ ALL_LINEAR_PRESET = [r"(?:^|\.)(?:layers?|layer)\.\d+\..*$"]
 
 class NoAdaptedLayersError(RuntimeError):
     """Raised when LoRA matched nothing, instead of training zero parameters."""
-
-
-def load_pairs(path: str) -> List[Dict]:
-    pairs = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line_num, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError as exc:
-                print(f"Warning: skipping malformed JSON on line {line_num}: {exc}")
-                continue
-            if "query" not in item or "positive" not in item:
-                print(f"Warning: skipping line {line_num} because query/positive is missing")
-                continue
-            pairs.append(item)
-    return pairs
 
 
 def batch_pairs(pairs: List[Dict], batch_size: int):
@@ -286,6 +269,8 @@ def apply_prefix(texts: Sequence[str], prefix: str) -> List[str]:
 
 
 def l2_normalize(x: mx.array, eps: float = 1e-12) -> mx.array:
+    # fp16 squares and the epsilon can underflow before division.
+    x = x.astype(mx.float32)
     return x / mx.maximum(mx.linalg.norm(x, axis=-1, keepdims=True), eps)
 
 
@@ -309,8 +294,9 @@ def encode_texts(
     return l2_normalize(embeds) if normalize else embeds
 
 
-def build_false_negative_mask(positives: Sequence[str], negatives: Sequence[str]) -> Optional[mx.array]:
-    """Mask candidates that duplicate a row's own positive text.
+def build_false_negative_mask(positives: Sequence[str], negatives: Sequence[str],
+                              relevant=None) -> Optional[mx.array]:
+    """Mask known relevant candidates other than the designated training target.
 
     Without this, two rows sharing (or repeating) a positive teach the model
     that a correct match is wrong.
@@ -322,7 +308,8 @@ def build_false_negative_mask(positives: Sequence[str], negatives: Sequence[str]
     for i in range(batch_size):
         row = []
         for j, text in enumerate(candidates):
-            duplicate = (j != i) and (text == positives[i])
+            duplicate = (j != i) and (text in relevant[i] if relevant is not None
+                                       else text == positives[i])
             if duplicate:
                 needs_mask = True
             row.append(-1e9 if duplicate else 0.0)
@@ -337,6 +324,7 @@ def info_nce_loss(
     candidate_embeds: mx.array,
     temperature: float = DEFAULT_TEMPERATURE,
     mask: Optional[mx.array] = None,
+    hardness_strength: float = 0.0,
 ) -> mx.array:
     """InfoNCE / MultipleNegativesRankingLoss.
 
@@ -344,9 +332,13 @@ def info_nce_loss(
     for row i is column i.
     """
     batch_size = query_embeds.shape[0]
-    logits = (query_embeds @ candidate_embeds.T) / temperature
+    similarities = query_embeds.astype(mx.float32) @ candidate_embeds.astype(mx.float32).T
+    logits = similarities / temperature
+    if hardness_strength:
+        is_negative = mx.arange(candidate_embeds.shape[0])[None, :] != mx.arange(batch_size)[:, None]
+        logits = logits + hardness_strength * mx.stop_gradient(similarities) * is_negative
     if mask is not None:
-        logits = logits + mask
+        logits = mx.where(mask < 0, -float("inf"), logits)
     log_probs = logits - mx.logsumexp(logits, axis=1, keepdims=True)
     targets = mx.arange(batch_size)
     return -mx.mean(log_probs[targets, targets])
@@ -358,6 +350,7 @@ def matryoshka_loss(
     dims: Sequence[int],
     temperature: float,
     mask: Optional[mx.array],
+    hardness_strength: float = 0.0,
 ) -> mx.array:
     """Matryoshka Representation Learning: train nested prefixes jointly.
 
@@ -372,7 +365,7 @@ def matryoshka_loss(
             continue
         q = l2_normalize(query_embeds[:, :dim])
         c = l2_normalize(candidate_embeds[:, :dim])
-        term = info_nce_loss(q, c, temperature, mask)
+        term = info_nce_loss(q, c, temperature, mask, hardness_strength)
         total = term if total is None else total + term
         used += 1
     if total is None:
@@ -394,7 +387,8 @@ def evaluate_loss(
     input_kwarg: str = "input_ids",
 ) -> float:
     total_loss = 0.0
-    num_batches = 0
+    num_queries = 0
+    relevant = known_positives(eval_pairs)
     for queries, positives, negatives in batch_pairs(eval_pairs, batch_size):
         if not use_hard_negatives:
             negatives = []
@@ -403,12 +397,12 @@ def evaluate_loss(
         c_tokens = tokenize_batch(tokenizer, c_texts, max_length)
         q_embeds = encode_texts(model, q_tokens["input_ids"], q_tokens["attention_mask"], normalize, input_kwarg)
         c_embeds = encode_texts(model, c_tokens["input_ids"], c_tokens["attention_mask"], normalize, input_kwarg)
-        mask = build_false_negative_mask(positives, negatives)
+        mask = build_false_negative_mask(positives, negatives, [relevant[q] for q in queries])
         loss = info_nce_loss(q_embeds, c_embeds, temperature, mask)
         mx.eval(loss)
-        total_loss += loss.item()
-        num_batches += 1
-    return total_loss / max(num_batches, 1)
+        total_loss += loss.item() * len(queries)
+        num_queries += len(queries)
+    return total_loss / max(num_queries, 1)
 
 
 def lora_weight_dict(model: nn.Module) -> Dict[str, mx.array]:
@@ -453,7 +447,8 @@ def load_lora_checkpoint(model: nn.Module, ckpt_dir: Path) -> nn.Module:
 
 
 def merge_and_save(model: nn.Module, model_name: str, output_dir: str,
-                   query_prefix: str = "", doc_prefix: str = "") -> Path:
+                   query_prefix: str = "", doc_prefix: str = "",
+                   run_metadata=None) -> Path:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -493,12 +488,27 @@ def merge_and_save(model: nn.Module, model_name: str, output_dir: str,
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
 
+    # Explicit per-layer quantization settings override saved-scales detection
+    # during reload. Fused layers are now dense, so discard their stale entries.
+    config_path = output_path / "config.json"
+    if dequantized and config_path.exists():
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        for key in ("quantization", "quantization_config"):
+            quantization = config.get(key)
+            if isinstance(quantization, dict):
+                for name, _ in fused_layers:
+                    quantization.pop(name, None)
+        config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+
     metadata = {
         "base_model": model_name,
         "fine_tuning": "lora",
         "framework": "mlx",
         "fused_layers": fused_count,
         "dequantized_on_merge": dequantized,
+        "remaining_quantized_modules": sum(isinstance(m, nn.QuantizedLinear)
+                                           for _, m in model.named_modules()),
+        "export_format": "mlx",
         "query_prefix": query_prefix,
         "doc_prefix": doc_prefix,
         "prefix_note": (
@@ -509,16 +519,66 @@ def merge_and_save(model: nn.Module, model_name: str, output_dir: str,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "notes": "Merged LoRA adapter weights for encoder fine-tuning.",
     }
+    metadata.update(run_metadata or {})
     with open(output_path / "training_metadata.json", "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
 
     if dequantized:
-        print("Note: base layers were quantized; merged weights are dequantized.")
+        print("Note: adapted layers were dequantized; other base layers may remain quantized.")
     print(f"Saved merged model with {fused_count} fused LoRA layers to {output_path}")
     return output_path
 
 
+def validate_args(args):
+    for name in ("batch_size", "grad_accum_steps", "epochs", "lora_rank", "max_length", "log_every"):
+        if getattr(args, name) < 1:
+            raise ValueError(f"--{name.replace('_', '-')} must be >= 1")
+    for name in ("temperature", "learning_rate", "lora_alpha"):
+        value = getattr(args, name)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be finite and positive")
+    for name in ("hardness_strength", "weight_decay"):
+        value = getattr(args, name)
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be finite and nonnegative")
+    if not 0 <= args.lora_dropout < 1:
+        raise ValueError("--lora-dropout must be in [0, 1)")
+    if min(args.eval_every, args.save_every, args.keep_checkpoints) < 0:
+        raise ValueError("Evaluation/save intervals and checkpoint retention must be nonnegative")
+    if args.matryoshka_dims:
+        try:
+            dims = [int(d) for d in args.matryoshka_dims.split(",")]
+            if min(dims) < 1 or len(set(dims)) != len(dims):
+                raise ValueError
+        except ValueError:
+            raise ValueError("--matryoshka-dims must contain distinct positive integers") from None
+    if args.hardness_strength and args.no_normalize:
+        raise ValueError("Hardness weighting requires normalized embeddings")
+    if (args.eval_corpus or args.best_metric != "loss") and not args.eval_pairs:
+        raise ValueError("--eval-corpus and retrieval checkpoint selection require --eval-pairs")
+    if args.best_metric != "loss" and args.eval_every == 0:
+        raise ValueError("Retrieval checkpoint selection requires evaluation to be enabled")
+
+
+def validate_training_step(loss, grads, require_nonzero=False):
+    """Materialize gradients each micro-batch; reject NaN/Inf before updates."""
+    leaves = [g.astype(mx.float32) for _, g in tree_flatten(grads)]
+    norm = mx.sqrt(sum(mx.sum(g * g) for g in leaves))
+    finite = mx.all(mx.stack([mx.all(mx.isfinite(g)) for g in leaves]))
+    mx.eval(loss, grads, norm, finite)
+    value, grad_norm = float(loss.item()), float(norm.item())
+    if not math.isfinite(value) or not bool(finite.item()) or not math.isfinite(grad_norm):
+        raise FloatingPointError("Nonfinite loss or gradients; optimizer update was not applied")
+    if require_nonzero and grad_norm == 0:
+        raise RuntimeError("Gradient norm is exactly zero — nothing would train.")
+    return value, grad_norm
+
+
 def train(args):
+    validate_args(args)
+    output_path = Path(args.output_dir)
+    if not args.dry_run and output_path.exists() and any(output_path.iterdir()):
+        raise ValueError(f"Output directory is not empty: {output_path}. Choose a new run directory.")
     print("\n" + "=" * 60)
     print("MLX EMBEDDING FINE-TUNING")
     print("=" * 60)
@@ -533,6 +593,8 @@ def train(args):
     print(f"Temperature:      {args.temperature}")
     print(f"Max length:       {args.max_length}")
     print(f"Hard negatives:   {not args.no_hard_negatives}")
+    print(f"Hardness weight:  {args.hardness_strength}")
+    print(f"Best metric:      {args.best_metric}")
     print(f"Query prefix:     {args.query_prefix!r}")
     print(f"Doc prefix:       {args.doc_prefix!r}")
     print(f"Target modules:   {args.target_modules}")
@@ -565,6 +627,8 @@ def train(args):
     )
     mx.eval(probe_out.text_embeds)
     embed_dim = probe_out.text_embeds.shape[-1]
+    if matryoshka_dims and max(matryoshka_dims) > embed_dim:
+        raise ValueError(f"Matryoshka dimensions exceed model dimension {embed_dim}")
     probe_norm = float(mx.linalg.norm(probe_out.text_embeds[0]).item())
     print(f"Embedding dimension: {embed_dim}")
     print(f"Base embedding L2 norm: {probe_norm:.4f}"
@@ -588,6 +652,10 @@ def train(args):
     eval_pairs = load_pairs(args.eval_pairs) if args.eval_pairs else None
     if not train_pairs:
         raise ValueError(f"No usable training pairs in {args.train_pairs}")
+    train_relevant = known_positives(train_pairs)
+    eval_corpus = load_corpus(args.eval_corpus) if args.eval_corpus else None
+    if eval_pairs and set(train_relevant) & set(known_positives(eval_pairs)):
+        raise ValueError("Train/eval queries overlap; split queries before mining or training")
     with_negatives = sum(1 for p in train_pairs if p.get("negatives"))
     print(f"Loaded {len(train_pairs)} training pairs ({with_negatives} with hard negatives)")
     if use_hard_negatives and with_negatives == 0:
@@ -603,7 +671,12 @@ def train(args):
     print(f"Total optimizer steps:     {total_steps}")
 
     print("\nStep 4: Setting up optimizer...")
-    warmup_fn = opt.schedulers.linear_schedule(init=0.0, end=args.learning_rate, steps=warmup_steps)
+    # Optimizer schedules are zero-indexed. Start the first update above zero,
+    # otherwise a one-step run completes without changing any parameters.
+    warmup_fn = opt.schedulers.linear_schedule(
+        init=args.learning_rate / warmup_steps, end=args.learning_rate,
+        steps=max(1, warmup_steps - 1),
+    )
     cosine_fn = opt.schedulers.cosine_decay(init=args.learning_rate, decay_steps=max(1, total_steps - warmup_steps))
     lr_schedule = opt.schedulers.join_schedules([warmup_fn, cosine_fn], [warmup_steps])
     optimizer = opt.AdamW(learning_rate=lr_schedule, weight_decay=args.weight_decay)
@@ -614,8 +687,8 @@ def train(args):
         q_embeds = encode_texts(model, q_ids, q_mask, normalize, input_kwarg)
         c_embeds = encode_texts(model, c_ids, c_mask, normalize, input_kwarg)
         if matryoshka_dims:
-            return matryoshka_loss(q_embeds, c_embeds, matryoshka_dims, args.temperature, fn_mask)
-        return info_nce_loss(q_embeds, c_embeds, args.temperature, fn_mask)
+            return matryoshka_loss(q_embeds, c_embeds, matryoshka_dims, args.temperature, fn_mask, args.hardness_strength)
+        return info_nce_loss(q_embeds, c_embeds, args.temperature, fn_mask, args.hardness_strength)
 
     loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
 
@@ -626,9 +699,10 @@ def train(args):
         c_tokens = tokenize_batch(
             tokenizer, apply_prefix(positives + negatives, args.doc_prefix), args.max_length
         )
-        fn_mask = build_false_negative_mask(positives, negatives)
+        fn_mask = build_false_negative_mask(positives, negatives, [train_relevant[q] for q in queries])
         return q_tokens, c_tokens, fn_mask
 
+    model.train()
     if args.dry_run:
         print("\n" + "=" * 60)
         print("DRY RUN")
@@ -647,13 +721,10 @@ def train(args):
             c_tokens["input_ids"], c_tokens["attention_mask"],
             fn_mask,
         )
-        mx.eval(loss, grads)
+        _, grad_norm = validate_training_step(loss, grads, require_nonzero=True)
         elapsed = time.time() - t0
-        grad_norm = math.sqrt(sum(float(mx.sum(g * g).item()) for _, g in tree_flatten(grads)))
         print(f"Loss: {loss.item():.4f}")
         print(f"Gradient L2 norm: {grad_norm:.6f}")
-        if grad_norm == 0.0:
-            raise RuntimeError("Gradient norm is exactly zero — nothing would train.")
         print(f"Forward + backward: {elapsed:.2f}s")
         print(f"Throughput: {len(queries) / elapsed:.1f} pairs/s")
         print(f"Estimated epoch time: {micro_steps_per_epoch * elapsed / 60:.1f} min")
@@ -690,141 +761,139 @@ def train(args):
     }
 
     global_step = 0
-    best_eval_loss = float("inf")
+    best_value = None
     best_step = None
+    last_eval_step = None
+    last_saved_step = None
     train_start = time.time()
-    log_file = open(output_path / "training_log.jsonl", "w", encoding="utf-8")
 
-    model.train()
-    print("\n" + "=" * 60)
-    print("TRAINING")
-    print("=" * 60)
+    with open(output_path / "training_log.jsonl", "w", encoding="utf-8") as log_file:
+        def log(entry):
+            log_file.write(json.dumps(entry, allow_nan=False) + "\n")
+            log_file.flush()
 
-    for epoch in range(args.epochs):
-        epoch_loss = 0.0
-        epoch_steps = 0
-        shuffled_pairs = train_pairs.copy()
-        random.shuffle(shuffled_pairs)
+        def save_checkpoint():
+            nonlocal last_saved_step
+            path = save_lora_checkpoint(model, args.output_dir, global_step, lora_config)
+            last_saved_step = global_step
+            return path
 
-        accumulated = None
-        accum_count = 0
-        accum_loss = 0.0
-        step_start = time.time()
-        pairs_in_step = 0
-
-        for queries, positives, negatives in batch_pairs(shuffled_pairs, args.batch_size):
-            q_tokens, c_tokens, fn_mask = prepare_batch(queries, positives, negatives)
-            loss, grads = loss_and_grad_fn(
-                model,
-                q_tokens["input_ids"], q_tokens["attention_mask"],
-                c_tokens["input_ids"], c_tokens["attention_mask"],
-                fn_mask,
-            )
-            accumulated = grads if accumulated is None else tree_map(mx.add, accumulated, grads)
-            accum_count += 1
-            accum_loss += loss.item()
-            pairs_in_step += len(queries)
-
-            if accum_count < args.grad_accum_steps:
-                continue
-
-            if args.grad_accum_steps > 1:
-                accumulated = tree_map(lambda g: g / args.grad_accum_steps, accumulated)
-            optimizer.update(model, accumulated)
-            mx.eval(model.parameters(), optimizer.state)
-
-            step_time = time.time() - step_start
-            loss_val = accum_loss / accum_count
-            epoch_loss += loss_val
-            epoch_steps += 1
-            global_step += 1
-            accumulated, accum_count, accum_loss = None, 0, 0.0
-
-            if global_step % args.log_every == 0 or global_step == 1:
-                current_lr = lr_schedule(global_step)
-                if hasattr(current_lr, "item"):
-                    current_lr = current_lr.item()
-                entry = {
-                    "step": global_step,
-                    "epoch": epoch + 1,
-                    "loss": round(loss_val, 4),
-                    "lr": round(float(current_lr), 8),
-                    "throughput": round(pairs_in_step / step_time, 2),
-                    "step_time": round(step_time, 2),
-                    "effective_batch": pairs_in_step,
-                }
-                print(
-                    f"Step {global_step:>5d}/{total_steps} | "
-                    f"Epoch {epoch + 1}/{args.epochs} | "
-                    f"Loss {loss_val:.4f} | "
-                    f"LR {float(current_lr):.2e} | "
-                    f"{pairs_in_step / step_time:.2f} pairs/s | "
-                    f"{step_time:.2f}s/step"
-                )
-                log_file.write(json.dumps(entry) + "\n")
-                log_file.flush()
-
-            if args.eval_every > 0 and eval_pairs and global_step % args.eval_every == 0:
-                model.eval()
-                eval_loss = evaluate_loss(
-                    model, tokenizer, eval_pairs, args.batch_size,
-                    args.temperature, args.max_length, normalize, use_hard_negatives,
+        def evaluate_checkpoint():
+            nonlocal best_value, best_step, last_eval_step
+            model.eval()
+            try:
+                value = evaluate_loss(
+                    model, tokenizer, eval_pairs, args.batch_size, args.temperature,
+                    args.max_length, normalize, use_hard_negatives,
                     args.query_prefix, args.doc_prefix, input_kwarg,
                 )
+                metrics = {"loss": value}
+                if args.best_metric != "loss" or eval_corpus is not None:
+                    from evaluate import evaluate_loaded_model
+                    result = evaluate_loaded_model(
+                        model, tokenizer, eval_pairs, args.max_length, args.batch_size,
+                        normalize, args.query_prefix, args.doc_prefix, corpus_texts=eval_corpus,
+                    )["retrieval"]
+                    metrics.update(ndcg_at_10=result["ndcg_at_10"],
+                                   mrr_at_10=result["mrr_at_10"],
+                                   recall_at_10=result["recall_at"][10])
+            finally:
                 model.train()
-                is_best = eval_loss < best_eval_loss
-                if is_best:
-                    best_eval_loss = eval_loss
-                    best_step = global_step
-                print(f"Evaluation at step {global_step}: loss={eval_loss:.4f}{' (new best)' if is_best else ''}")
-                log_file.write(json.dumps({"step": global_step, "eval_loss": round(eval_loss, 4), "is_best": is_best}) + "\n")
-                log_file.flush()
+            if not all(math.isfinite(v) for v in metrics.values()):
+                raise FloatingPointError("Evaluation produced a nonfinite metric")
+            value = metrics[args.best_metric]
+            is_best = best_value is None or (value < best_value if args.best_metric == "loss"
+                                             else value > best_value)
+            if is_best:
+                best_value, best_step = value, global_step
+            last_eval_step = global_step
+            print(f"Evaluation at step {global_step}: {args.best_metric}={value:.6f}"
+                  f"{' (new best)' if is_best else ''}")
+            log({"step": global_step, "eval_loss": metrics["loss"],
+                 "eval_metrics": metrics, "is_best": is_best})
+            ckpt_path = save_checkpoint()
+            if is_best:
+                best_path = output_path / "best"
+                best_path.mkdir(exist_ok=True)
+                for item in ckpt_path.iterdir():
+                    shutil.copy2(item, best_path / item.name)
+            prune_checkpoints(args.output_dir, args.keep_checkpoints)
 
-                ckpt_path = save_lora_checkpoint(model, args.output_dir, global_step, lora_config)
-                print(f"Saved checkpoint to {ckpt_path}")
-                if is_best:
-                    best_path = Path(args.output_dir) / "best"
-                    best_path.mkdir(parents=True, exist_ok=True)
-                    for item in ckpt_path.iterdir():
-                        shutil.copy2(item, best_path / item.name)
-                    print(f"Updated best checkpoint at {best_path}")
-                prune_checkpoints(args.output_dir, args.keep_checkpoints)
+        print("\nTRAINING")
+        for epoch in range(args.epochs):
+            shuffled_pairs = train_pairs.copy()
+            random.shuffle(shuffled_pairs)
+            epoch_loss, epoch_pairs = 0.0, 0
+            # Explicit windows ensure a partial final window takes the same path
+            # through the optimizer, logging, evaluation and saving hooks.
+            window_size = args.batch_size * args.grad_accum_steps
+            for offset in range(0, len(shuffled_pairs), window_size):
+                window = shuffled_pairs[offset:offset + window_size]
+                accumulated = None
+                loss_sum = 0.0
+                step_start = time.time()
+                for queries, positives, negatives in batch_pairs(window, args.batch_size):
+                    q_tokens, c_tokens, fn_mask = prepare_batch(queries, positives, negatives)
+                    loss, grads = loss_and_grad_fn(
+                        model, q_tokens["input_ids"], q_tokens["attention_mask"],
+                        c_tokens["input_ids"], c_tokens["attention_mask"], fn_mask,
+                    )
+                    loss_value, _ = validate_training_step(loss, grads)
+                    weight = len(queries) / len(window)
+                    weighted = tree_map(lambda g: g * weight, grads)
+                    accumulated = weighted if accumulated is None else tree_map(mx.add, accumulated, weighted)
+                    mx.eval(accumulated)
+                    loss_sum += loss_value * len(queries)
+                loss_value = loss_sum / len(window)
+                validate_training_step(mx.array(loss_value), accumulated)
+                optimizer.update(model, accumulated)
+                mx.eval(model.parameters(), optimizer.state)
+                # The optimizer evaluates its schedule during update(); reading
+                # it beforehand logs the previous step's learning rate.
+                current_lr = float(optimizer.learning_rate.item())
+                global_step += 1
+                epoch_loss += loss_sum
+                epoch_pairs += len(window)
+                step_time = time.time() - step_start
+                if global_step == 1 or global_step % args.log_every == 0:
+                    log({"step": global_step, "epoch": epoch + 1, "loss": loss_value,
+                         "lr": current_lr, "throughput": len(window) / step_time,
+                         "step_time": step_time, "effective_batch": len(window)})
+                    print(f"Step {global_step}/{total_steps} | loss {loss_value:.6f} | "
+                          f"{len(window) / step_time:.2f} pairs/s")
+                if eval_pairs and args.eval_every and global_step % args.eval_every == 0:
+                    evaluate_checkpoint()
+                elif args.save_every and global_step % args.save_every == 0:
+                    save_checkpoint()
+                    prune_checkpoints(args.output_dir, args.keep_checkpoints)
+            print(f"Epoch {epoch + 1}/{args.epochs} | loss {epoch_loss / epoch_pairs:.6f}")
 
-            step_start = time.time()
-            pairs_in_step = 0
+        # Short runs and runs ending between evaluation intervals still compare
+        # their final state. --eval-every 0 explicitly disables all evaluations.
+        if eval_pairs and args.eval_every and last_eval_step != global_step:
+            evaluate_checkpoint()
+        if last_saved_step != global_step:
+            save_checkpoint()
+            prune_checkpoints(args.output_dir, args.keep_checkpoints)
 
-        # Flush a partial accumulation window at the end of the epoch.
-        if accumulated is not None and accum_count > 0:
-            accumulated = tree_map(lambda g: g / accum_count, accumulated)
-            optimizer.update(model, accumulated)
-            mx.eval(model.parameters(), optimizer.state)
-            epoch_loss += accum_loss / accum_count
-            epoch_steps += 1
-            global_step += 1
-
-        avg_epoch_loss = epoch_loss / max(epoch_steps, 1)
-        print(f"Epoch {epoch + 1}/{args.epochs} complete | avg loss {avg_epoch_loss:.4f}")
-
-    log_file.close()
-    total_time = time.time() - train_start
-    print("\n" + "=" * 60)
-    print("TRAINING COMPLETE")
-    print("=" * 60)
-    print(f"Total time: {total_time / 60:.1f} min")
-
-    best_path = Path(args.output_dir) / "best"
-    if best_step is not None:
-        print(f"Best eval loss: {best_eval_loss:.4f} at step {best_step}")
-    if args.merge == "best" and best_path.exists():
-        print(f"Restoring best checkpoint (step {best_step}) before merge...")
-        load_lora_checkpoint(model, best_path)
+    print(f"Training complete in {(time.time() - train_start) / 60:.1f} min")
+    selected_step = global_step
+    if args.merge == "best" and best_step is not None:
+        print(f"Restoring best checkpoint: step {best_step}, {args.best_metric}={best_value:.6f}")
+        load_lora_checkpoint(model, output_path / "best")
+        selected_step = best_step
     elif args.merge == "best":
-        print("No best checkpoint recorded (no evaluation ran); merging final weights.")
-    else:
-        print("Merging final-step weights (--merge final).")
-
-    print("\nMerging LoRA weights and saving final model...")
-    merge_and_save(model, args.model, args.output_dir, args.query_prefix, args.doc_prefix)
+        print("No best checkpoint recorded by this run; merging final weights.")
+    merge_and_save(model, args.model, args.output_dir, args.query_prefix, args.doc_prefix,
+                   run_metadata={
+                       "selected_step": selected_step, "final_step": global_step,
+                       "best_step": best_step, "best_metric": args.best_metric,
+                       "best_value": best_value, "matryoshka_dims": matryoshka_dims,
+                       "hardness_strength": args.hardness_strength,
+                       "max_length": args.max_length,
+                       "train_sha256": file_digest(args.train_pairs),
+                       "eval_sha256": file_digest(args.eval_pairs) if args.eval_pairs else None,
+                   })
     print("Done.")
 
 
@@ -843,7 +912,13 @@ Examples:
         """,
     )
     parser.add_argument("--train-pairs", required=True, help="JSONL file with training pairs")
-    parser.add_argument("--eval-pairs", default=None, help="Optional JSONL file with eval pairs")
+    parser.add_argument("--eval-pairs", default=None, help="Optional held-out validation pairs")
+    parser.add_argument("--eval-corpus", help="Additional validation corpus JSONL (id/text)")
+    parser.add_argument("--best-metric", choices=["loss", "ndcg_at_10", "mrr_at_10", "recall_at_10"],
+                        default="loss", help="Metric used to select the best checkpoint")
+    parser.add_argument("--save-every", type=int, default=100, help="Save adapters every N steps; 0 disables periodic saves")
+    parser.add_argument("--hardness-strength", type=float, default=0.0,
+                        help="Detached cosine penalty on all negatives; 0 preserves standard InfoNCE")
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Model path or repository (default: {DEFAULT_MODEL})")
     parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
     parser.add_argument("--batch-size", type=int, default=16, help="Micro-batch size (pairs per forward pass)")
@@ -888,8 +963,10 @@ Examples:
 def main():
     parser = build_parser()
     args = parser.parse_args()
-    if args.grad_accum_steps < 1:
-        parser.error("--grad-accum-steps must be >= 1")
+    try:
+        validate_args(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.seed is not None:
         random.seed(args.seed)
         mx.random.seed(args.seed)
