@@ -1,0 +1,80 @@
+{
+  "date": "2026-09-24",
+  "kind": "untuned baseline; evaluator validation, not an upgrade ablation",
+  "model": "mlx-community/all-MiniLM-L6-v2-bf16",
+  "model_revision": "b6691709eacd8f0afcc3faace288cf50e611f3aa",
+  "dataset": "BEIR SciFact test",
+  "archive_url": "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/scifact.zip",
+  "archive_sha256": "536e14446a0ba56ed1398ab1055f39fe852686ecad24a6306c80c490fa8e0165",
+  "max_length": 256,
+  "batch_size": 32,
+  "query_chunk_size": 64,
+  "corpus_chunk_size": 4096,
+  "prefixes": {
+    "query": "",
+    "document": ""
+  },
+  "provenance": {
+    "eval_sha256": "4ec19c459f9faf2e684730f020e77998caf7e932a56100cec053787a910fb05b",
+    "corpus_sha256": "c05b6f8c5f992f84ec7b78312947a19317a1a43cb67e1d7eaf9eaa33f14e5def",
+    "versions": {
+      "mlx": "0.32.2",
+      "mlx-embeddings": "0.1.0",
+      "mlx-lm": "0.31.3",
+      "numpy": "2.5.3",
+      "transformers": "5.17.0"
+    }
+  },
+  "source_data": {
+    "split": "test",
+    "relevance": "binary (score > 0)",
+    "queries": 300,
+    "documents": 5183,
+    "source_sha256": {
+      "corpus.jsonl": "dec31c8182f3d744c7d2c09423756fd1d17cbef75808db13ba01cc0aab4d1ac6",
+      "queries.jsonl": "8ff84a7c903f722981cd8d595c022660140c51867b27608a6d4910db86080313",
+      "qrels/test.tsv": "0864bb985e0ca2367ba217977e72004d549054b2b06666ed9d4825ac7c21284c"
+    }
+  },
+  "dimensions": {
+    "384": {
+      "n": 300,
+      "corpus_size": 5183,
+      "max_k": 10,
+      "recall_at": {
+        "1": 0.4823333333333333,
+        "3": 0.6603333333333333,
+        "5": 0.7379444444444444,
+        "10": 0.785
+      },
+      "mrr_at_10": 0.6048915343915343,
+      "ndcg_at_10": 0.6455319312669425
+    },
+    "128": {
+      "n": 300,
+      "corpus_size": 5183,
+      "max_k": 10,
+      "recall_at": {
+        "1": 0.43122222222222223,
+        "3": 0.5906111111111111,
+        "5": 0.6633888888888888,
+        "10": 0.7583333333333333
+      },
+      "mrr_at_10": 0.5543730158730158,
+      "ndcg_at_10": 0.59913707982979
+    },
+    "64": {
+      "n": 300,
+      "corpus_size": 5183,
+      "max_k": 10,
+      "recall_at": {
+        "1": 0.33955555555555555,
+        "3": 0.49894444444444436,
+        "5": 0.5581111111111111,
+        "10": 0.6144999999999999
+      },
+      "mrr_at_10": 0.445021164021164,
+      "ndcg_at_10": 0.48389175259212447
+    }
+  }
+}
