@@ -72,14 +72,19 @@ def read_trained_prefixes(model_dir: str):
         return None
     try:
         data = json.loads(meta.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Invalid training metadata at {meta}: {exc}") from exc
+    if not isinstance(data, dict) or any(
+        key in data and not isinstance(data[key], str) for key in ("query_prefix", "doc_prefix")
+    ):
+        raise ValueError(f"Invalid training metadata at {meta}: prefixes must be strings")
     if "query_prefix" not in data and "doc_prefix" not in data:
         return None
     return data.get("query_prefix", ""), data.get("doc_prefix", "")
 
 
 def l2_normalize(x: mx.array, eps: float = 1e-12) -> mx.array:
+    x = x.astype(mx.float32)
     return x / mx.maximum(mx.linalg.norm(x, axis=-1, keepdims=True), eps)
 
 
@@ -293,6 +298,8 @@ def main():
     parser.add_argument("--json-out", default=None, help="Optional path to write full results as JSON")
     args = parser.parse_args()
 
+    if args.json_out and (Path(args.json_out).exists() or Path(args.json_out).is_symlink()):
+        parser.error("--json-out already exists; choose a new report path")
     if min(args.batch_size, args.max_length, args.query_chunk_size, args.corpus_chunk_size) < 1:
         parser.error("Batch size, max length and chunk sizes must be positive")
     try:
@@ -343,8 +350,9 @@ def main():
             print(f"{dim} dimensions: nDCG@10={metrics['ndcg_at_10']:.4f}, "
                   f"MRR@10={metrics['mrr_at_10']:.4f}, recall={metrics['recall_at']}")
     if args.json_out:
-        with open(args.json_out, "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=2, allow_nan=False)
+        serialized = json.dumps(report, indent=2, allow_nan=False)
+        with open(args.json_out, "x", encoding="utf-8") as f:
+            f.write(serialized + "\n")
         print(f"\nWrote full results to {args.json_out}")
 
 

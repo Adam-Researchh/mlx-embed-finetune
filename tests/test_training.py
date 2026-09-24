@@ -162,3 +162,47 @@ def test_invalid_settings_rejected(flags):
     args = train.build_parser().parse_args(["--train-pairs", "unused", *flags])
     with pytest.raises(ValueError):
         train.validate_args(args)
+
+
+def test_single_optimizer_step_actually_changes_adapters(tmp_path, monkeypatch):
+    args, _, _ = setup_run(tmp_path, monkeypatch, rows=1,
+                           extra=["--eval-every", "0", "--weight-decay", "0"])
+    mx.random.seed(11)
+    snapshots = {}
+    freeze = train.freeze_base_and_enable_lora
+
+    def capture_before(model):
+        freeze(model)
+        snapshots["before"] = {name: np.array(value) for name, value in train.lora_weight_dict(model).items()}
+        return model
+
+    def capture_after(model, *args, **kwargs):
+        snapshots["after"] = {name: np.array(value) for name, value in train.lora_weight_dict(model).items()}
+
+    monkeypatch.setattr(train, "freeze_base_and_enable_lora", capture_before)
+    monkeypatch.setattr(train, "merge_and_save", capture_after)
+    train.train(args)
+    assert any(not np.array_equal(before, snapshots["after"][name])
+               for name, before in snapshots["before"].items())
+
+
+def test_half_precision_normalization_handles_tiny_and_zero_vectors():
+    x = mx.array([[1e-5, 0.], [0., 0.]], dtype=mx.float16)
+    normalized = np.array(train.l2_normalize(x))
+    assert np.isfinite(normalized).all()
+    np.testing.assert_allclose(normalized[0], [1., 0.], atol=1e-5)
+
+
+def test_logged_learning_rate_is_the_one_actually_applied(tmp_path, monkeypatch):
+    args, _, _ = setup_run(tmp_path, monkeypatch, extra=["--eval-every", "0"])
+    applied = []
+    original = train.opt.AdamW.update
+
+    def record_update(optimizer, *args, **kwargs):
+        original(optimizer, *args, **kwargs)
+        applied.append(float(optimizer.learning_rate.item()))
+
+    monkeypatch.setattr(train.opt.AdamW, "update", record_update)
+    train.train(args)
+    entries = [json.loads(line) for line in (tmp_path / "out/training_log.jsonl").read_text().splitlines()]
+    assert [row["lr"] for row in entries if "lr" in row] == applied

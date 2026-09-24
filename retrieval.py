@@ -91,7 +91,30 @@ def file_digest(path):
 
 def normalize_embeddings(embeddings):
     x = np.asarray(embeddings, dtype=np.float32)
-    return x / np.maximum(np.linalg.norm(x, axis=-1, keepdims=True), 1e-12)
+    if x.ndim != 2 or not x.shape[1] or not np.isfinite(x).all():
+        raise ValueError("Expected a finite embedding matrix with nonzero dimensions")
+    # Scaling first prevents squaring large finite components from overflowing.
+    scale = np.max(np.abs(x), axis=-1, keepdims=True)
+    scaled = x / np.where(scale > 0, scale, 1)
+    norm = np.linalg.norm(scaled, axis=-1, keepdims=True)
+    return scaled / np.where(norm > 0, norm, 1)
+
+
+def validate_embedding_pair(query_embeddings, corpus_embeddings, label="Retrieval"):
+    q = np.asarray(query_embeddings, dtype=np.float32)
+    c = np.asarray(corpus_embeddings, dtype=np.float32)
+    if (q.ndim != 2 or c.ndim != 2 or q.shape[1] != c.shape[1]
+            or not q.shape[1] or not len(q) or not len(c)):
+        raise ValueError(f"{label}: expected nonempty matrices with matching nonzero dimensions")
+    if not np.isfinite(q).all() or not np.isfinite(c).all():
+        raise ValueError(f"{label} embeddings must be finite")
+    if np.any(~np.any(q != 0, axis=1)) or np.any(~np.any(c != 0, axis=1)):
+        raise ValueError(f"{label} embeddings contain a zero vector; check the model and pooling")
+    return q, c
+
+
+def positive_integer(value):
+    return isinstance(value, (int, np.integer)) and not isinstance(value, (bool, np.bool_)) and value > 0
 
 
 def search_top_k(query_embeddings, corpus_embeddings, k, query_chunk_size=64,
@@ -101,21 +124,19 @@ def search_top_k(query_embeddings, corpus_embeddings, k, query_chunk_size=64,
     Stores embeddings and at most a query-chunk x corpus-chunk score matrix;
     never creates the full query x corpus matrix or Python rankings of all docs.
     """
-    q = np.asarray(query_embeddings, dtype=np.float32)
-    c = np.asarray(corpus_embeddings, dtype=np.float32)
-    if q.ndim != 2 or c.ndim != 2 or q.shape[1] != c.shape[1] or not len(q) or not len(c):
-        raise ValueError("Expected nonempty query/corpus matrices with matching dimensions")
-    if not np.isfinite(q).all() or not np.isfinite(c).all():
-        raise ValueError("Retrieval embeddings must be finite")
-    if min(k, query_chunk_size, corpus_chunk_size) < 1:
-        raise ValueError("k and retrieval chunk sizes must be positive")
+    q, c = validate_embedding_pair(query_embeddings, corpus_embeddings)
+    if not all(positive_integer(value) for value in (k, query_chunk_size, corpus_chunk_size)):
+        raise ValueError("k and retrieval chunk sizes must be positive integers")
     k = min(k, len(c))
     for start in range(0, len(q), query_chunk_size):
         window = q[start:start + query_chunk_size]
         best_scores = np.empty((len(window), 0), dtype=np.float32)
         best_ids = np.empty((len(window), 0), dtype=np.int64)
         for offset in range(0, len(c), corpus_chunk_size):
-            scores = window @ c[offset:offset + corpus_chunk_size].T
+            with np.errstate(over="ignore", invalid="ignore"):
+                scores = window @ c[offset:offset + corpus_chunk_size].T
+            if not np.isfinite(scores).all():
+                raise ValueError("Retrieval similarities must be finite; normalize embeddings before scoring")
             ids = np.broadcast_to(np.arange(offset, offset + scores.shape[1]), scores.shape)
             scores = np.concatenate((best_scores, scores), axis=1)
             ids = np.concatenate((best_ids, ids), axis=1)
@@ -128,12 +149,14 @@ def search_top_k(query_embeddings, corpus_embeddings, k, query_chunk_size=64,
 def retrieval_metrics(query_embeddings, corpus_embeddings, relevant, ks=(1, 3, 5, 10),
                       query_chunk_size=64, corpus_chunk_size=4096):
     """Macro recall, MRR@10, binary nDCG@10; each query may have many positives."""
-    if not ks or min(ks) < 1:
-        raise ValueError("Recall cutoffs must be positive")
-    if len(relevant) != len(query_embeddings) or any(not gold for gold in relevant):
+    query_embeddings, corpus_embeddings = validate_embedding_pair(query_embeddings, corpus_embeddings)
+    if not ks or not all(positive_integer(k) for k in ks):
+        raise ValueError("Recall cutoffs must be positive integers")
+    if len(relevant) != len(query_embeddings) or any(len(gold) == 0 for gold in relevant):
         raise ValueError("Every query must have at least one relevant document")
-    if any(i < 0 or i >= len(corpus_embeddings) for gold in relevant for i in gold):
-        raise ValueError("Relevant document index outside corpus")
+    if any(not isinstance(i, (int, np.integer)) or isinstance(i, (bool, np.bool_))
+           or i < 0 or i >= len(corpus_embeddings) for gold in relevant for i in gold):
+        raise ValueError("Relevant document index must be an integer inside the corpus")
     rows = []
     for start, indices, _ in search_top_k(
         query_embeddings, corpus_embeddings, max(10, *ks), query_chunk_size, corpus_chunk_size

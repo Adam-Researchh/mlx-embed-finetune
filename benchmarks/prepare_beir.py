@@ -9,6 +9,7 @@ Judgments with score > 0 are treated as binary relevance, as in SciFact.
 import argparse
 import csv
 import json
+import math
 from pathlib import Path
 
 from retrieval import file_digest, read_jsonl
@@ -34,11 +35,17 @@ def prepare(data_dir, split, output_dir):
         queries[query_id] = row["text"]
     relevant = {}
     with qrels_path.open(encoding="utf-8") as stream:
-        for row in csv.DictReader(stream, delimiter="\t"):
+        for line_number, row in enumerate(csv.DictReader(stream, delimiter="\t"), 2):
             query_id, doc_id = row["query-id"], row["corpus-id"]
             if query_id not in queries or doc_id not in corpus:
                 raise ValueError(f"Unresolved judgment: {query_id}/{doc_id}")
-            if float(row["score"]) > 0:
+            try:
+                score = float(row["score"])
+            except (ValueError, TypeError) as exc:
+                raise ValueError(f"{qrels_path}:{line_number}: invalid relevance score") from exc
+            if not math.isfinite(score):
+                raise ValueError(f"{qrels_path}:{line_number}: relevance score must be finite")
+            if score > 0:
                 relevant.setdefault(query_id, []).append(doc_id)
     if not relevant:
         raise ValueError("No positive judgments in this split")

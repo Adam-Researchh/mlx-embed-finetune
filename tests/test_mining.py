@@ -45,3 +45,11 @@ def test_partial_guide_rejected():
     with pytest.raises(ValueError, match="both guide"):
         mine_negatives([{"query": "q", "positive": "p"}], ["p"], [[1]], [[1]],
                        guide_query_embeddings=[[1]])
+
+
+@pytest.mark.parametrize("guide_q,guide_c", [([[0]], [[1], [.5]]),
+                                          ([[1e30]], [[1e30], [1e30]])])
+def test_invalid_guide_cannot_disable_filtering(guide_q, guide_c):
+    with pytest.raises(ValueError, match="Guide"):
+        mine_negatives([{"query": "q", "positive": "p"}], ["p", "n"], [[1]], [[1], [.5]],
+                       guide_query_embeddings=guide_q, guide_corpus_embeddings=guide_c)

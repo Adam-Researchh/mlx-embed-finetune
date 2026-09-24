@@ -1,4 +1,5 @@
 import json
+import pytest
 
 from benchmarks.prepare_beir import prepare
 from retrieval import load_pairs
@@ -21,3 +22,15 @@ def test_beir_conversion_keeps_multiple_positives_and_provenance(tmp_path):
     assert pairs[0]["positive"] == "Title First"
     assert pairs[0]["positives"] == ["Second"]
     assert json.loads((out / "manifest.json").read_text()) == manifest
+
+
+@pytest.mark.parametrize("score", ["NaN", "Infinity", "-Infinity"])
+def test_nonfinite_judgments_fail_before_writing_dataset(tmp_path, score):
+    source = tmp_path / "source"
+    (source / "qrels").mkdir(parents=True)
+    (source / "corpus.jsonl").write_text('{"_id":"d","text":"Document"}\n')
+    (source / "queries.jsonl").write_text('{"_id":"q","text":"Question"}\n')
+    (source / "qrels/test.tsv").write_text(f'query-id\tcorpus-id\tscore\nq\td\t{score}\n')
+    with pytest.raises(ValueError, match="finite"):
+        prepare(source, "test", tmp_path / "output")
+    assert not (tmp_path / "output").exists()

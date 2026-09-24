@@ -63,7 +63,8 @@ nonfinite. Training also checks for nonfinite values before every update.
 - **Gradient accumulation** for a larger optimizer batch; the contrastive
   negative pool remains local to each micro-batch
 - Explicit L2 normalization, so the InfoNCE temperature means what it says
-- AdamW with linear warmup → cosine decay
+- AdamW with linear warmup → cosine decay; the first update has a nonzero
+  learning rate, including a run with only one optimizer step
 - Periodic and final evaluation, loss or retrieval-based checkpoint selection,
   independent adapter saving, and checkpoint retention
 - **The exported model is the best checkpoint by default**, not whatever the
@@ -163,6 +164,9 @@ Use `--dims 512,256,128` for a Matryoshka evaluation sweep (dimensions must fit
 the model). Truncated embeddings are re-normalized. Full dimension is always
 reported. Omit `--tuned-model` for a baseline-only run. JSON results include
 per-query metrics, file hashes, runtime versions, and the evaluation settings.
+Report paths must be new files: `--json-out` never overwrites existing inputs or
+reports. Invalid prompt metadata, zero/nonfinite embeddings, and overflowing
+similarities raise instead of silently producing misleading metrics.
 
 For a reproducible public task, see [the SciFact recipe](benchmarks/scifact.md).
 Use validation data for `--best-metric ndcg_at_10`; keep the final test set out
@@ -269,6 +273,8 @@ to demonstrate that fine-tuning helped.
 - Merging into a quantized base **dequantizes adapted layers**; other layers
   may remain quantized. Metadata records both facts. The export is in MLX
   format; conversion to Transformers or GGUF needs separate validation.
+  Stale per-layer quantization overrides are removed for fused dense layers so
+  the MLX loader does not re-quantize them during reload.
 - Saved checkpoints contain adapters and adapter configuration, not optimizer
   or RNG state. Exact training resume is not implemented.
 - Gradient accumulation averages several micro-batch gradients. It does not

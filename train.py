@@ -269,6 +269,8 @@ def apply_prefix(texts: Sequence[str], prefix: str) -> List[str]:
 
 
 def l2_normalize(x: mx.array, eps: float = 1e-12) -> mx.array:
+    # fp16 squares and the epsilon can underflow before division.
+    x = x.astype(mx.float32)
     return x / mx.maximum(mx.linalg.norm(x, axis=-1, keepdims=True), eps)
 
 
@@ -486,6 +488,18 @@ def merge_and_save(model: nn.Module, model_name: str, output_dir: str,
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
 
+    # Explicit per-layer quantization settings override saved-scales detection
+    # during reload. Fused layers are now dense, so discard their stale entries.
+    config_path = output_path / "config.json"
+    if dequantized and config_path.exists():
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        for key in ("quantization", "quantization_config"):
+            quantization = config.get(key)
+            if isinstance(quantization, dict):
+                for name, _ in fused_layers:
+                    quantization.pop(name, None)
+        config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+
     metadata = {
         "base_model": model_name,
         "fine_tuning": "lora",
@@ -657,7 +671,12 @@ def train(args):
     print(f"Total optimizer steps:     {total_steps}")
 
     print("\nStep 4: Setting up optimizer...")
-    warmup_fn = opt.schedulers.linear_schedule(init=0.0, end=args.learning_rate, steps=warmup_steps)
+    # Optimizer schedules are zero-indexed. Start the first update above zero,
+    # otherwise a one-step run completes without changing any parameters.
+    warmup_fn = opt.schedulers.linear_schedule(
+        init=args.learning_rate / warmup_steps, end=args.learning_rate,
+        steps=max(1, warmup_steps - 1),
+    )
     cosine_fn = opt.schedulers.cosine_decay(init=args.learning_rate, decay_steps=max(1, total_steps - warmup_steps))
     lr_schedule = opt.schedulers.join_schedules([warmup_fn, cosine_fn], [warmup_steps])
     optimizer = opt.AdamW(learning_rate=lr_schedule, weight_decay=args.weight_decay)
@@ -827,9 +846,11 @@ def train(args):
                     loss_sum += loss_value * len(queries)
                 loss_value = loss_sum / len(window)
                 validate_training_step(mx.array(loss_value), accumulated)
-                current_lr = float(optimizer.learning_rate.item())
                 optimizer.update(model, accumulated)
                 mx.eval(model.parameters(), optimizer.state)
+                # The optimizer evaluates its schedule during update(); reading
+                # it beforehand logs the previous step's learning rate.
+                current_lr = float(optimizer.learning_rate.item())
                 global_step += 1
                 epoch_loss += loss_sum
                 epoch_pairs += len(window)

@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from retrieval import (known_positives, load_corpus, load_pairs, pooled_corpus,
-                       retrieval_metrics, search_top_k)
+                       normalize_embeddings, retrieval_metrics, search_top_k)
 
 
 def test_chunked_search_matches_dense_including_ties():
@@ -75,3 +75,58 @@ def test_invalid_or_nonfinite_search_rejected():
         list(search_top_k([[1]], [[1]], 0))
     with pytest.raises(ValueError, match="relevant"):
         retrieval_metrics([[1]], [[1]], [set()])
+
+
+def test_normalization_does_not_silently_overflow_to_zero():
+    with np.errstate(over="ignore"):
+        actual = normalize_embeddings([[1e30, 1e30]])
+    assert np.linalg.norm(actual) == pytest.approx(1.)
+
+
+@pytest.mark.parametrize("q,c", [(np.ones((1, 0)), np.ones((1, 0))),
+                                 ([[0., 0.]], [[1., 0.]]),
+                                 ([[1., 0.]], [[0., 0.]])])
+def test_degenerate_embeddings_cannot_report_perfect_retrieval(q, c):
+    with pytest.raises(ValueError):
+        retrieval_metrics(q, c, [{0}])
+
+
+def test_overflowing_similarity_rejected():
+    with np.errstate(over="ignore"), pytest.raises(ValueError, match="finite"):
+        list(search_top_k([[1e30]], [[1e30]], 1))
+
+
+@pytest.mark.parametrize("gold", [{.5}, {float("nan")}, {True}, {"0"}])
+def test_malformed_relevance_indices_rejected(gold):
+    with pytest.raises(ValueError, match="index"):
+        retrieval_metrics([[1]], [[1]], [gold])
+
+
+def test_randomized_chunking_and_metrics_against_scalar_reference():
+    rng = np.random.default_rng(1901)
+    for _ in range(150):
+        nq, nc, nd = int(rng.integers(1, 9)), int(rng.integers(1, 45)), int(rng.integers(1, 11))
+        q = rng.integers(-4, 5, (nq, nd)).astype(np.float32)
+        c = rng.integers(-4, 5, (nc, nd)).astype(np.float32)
+        q[~np.any(q, axis=1), 0] = 1
+        c[~np.any(c, axis=1), 0] = 1
+        k = int(rng.integers(1, nc + 5))
+        scores = q @ c.T
+        reference = np.lexsort((np.broadcast_to(np.arange(nc), scores.shape), -scores), axis=1)
+        actual = np.concatenate([ids for _, ids, _ in search_top_k(
+            q, c, k, int(rng.integers(1, 7)), int(rng.integers(1, 12)))])
+        np.testing.assert_array_equal(actual, reference[:, :k])
+        gold = [set(rng.choice(nc, int(rng.integers(1, nc + 1)), replace=False).tolist()) for _ in range(nq)]
+        metrics = retrieval_metrics(q, c, gold)
+        recalls, mrr, ndcg = [], [], []
+        for ids, relevant in zip(reference, gold):
+            ranked = ids.tolist()
+            recalls.append(len(set(ranked[:10]) & relevant) / len(relevant))
+            first = min(ranked.index(g) + 1 for g in relevant)
+            mrr.append(1 / first if first <= 10 else 0)
+            dcg = sum(1 / np.log2(rank + 2) for rank, doc in enumerate(ranked[:10]) if doc in relevant)
+            ideal = sum(1 / np.log2(rank + 2) for rank in range(min(10, len(relevant))))
+            ndcg.append(dcg / ideal)
+        assert metrics["recall_at"][10] == pytest.approx(np.mean(recalls))
+        assert metrics["mrr_at_10"] == pytest.approx(np.mean(mrr))
+        assert metrics["ndcg_at_10"] == pytest.approx(np.mean(ndcg))

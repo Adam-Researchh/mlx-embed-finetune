@@ -9,7 +9,8 @@ from pathlib import Path
 import numpy as np
 
 from retrieval import (document_id, file_digest, known_positives, load_corpus,
-                       load_pairs, pooled_corpus, search_top_k)
+                       load_pairs, pooled_corpus, positive_integer, search_top_k,
+                       validate_embedding_pair)
 
 
 def mine_negatives(pairs, corpus, query_embeddings, corpus_embeddings, num_negatives=3,
@@ -22,21 +23,28 @@ def mine_negatives(pairs, corpus, query_embeddings, corpus_embeddings, num_negat
     margin in the guide space (or miner space when no guide is supplied).
     Shortfalls are reported; filtering is never relaxed to fill a quota.
     """
-    if num_negatives < 1 or range_min < 0 or range_max <= range_min:
+    if (not positive_integer(num_negatives) or not isinstance(range_min, (int, np.integer))
+            or isinstance(range_min, (bool, np.bool_)) or range_min < 0
+            or not positive_integer(range_max) or range_max <= range_min):
         raise ValueError("Require positive num_negatives and 0 <= range_min < range_max")
     if any(not math.isfinite(v) or v < 0 for v in (relative_margin, absolute_margin)):
         raise ValueError("Margins must be finite and nonnegative")
-    q = np.asarray(query_embeddings, dtype=np.float32)
-    c = np.asarray(corpus_embeddings, dtype=np.float32)
+    q, c = validate_embedding_pair(query_embeddings, corpus_embeddings)
     if len(pairs) != len(q) or len(corpus) != len(c) or len(set(corpus)) != len(corpus):
         raise ValueError("Embeddings must match pairs and the deduplicated corpus")
     if (guide_query_embeddings is None) != (guide_corpus_embeddings is None):
         raise ValueError("Supply both guide query and corpus embeddings")
-    gq = q if guide_query_embeddings is None else np.asarray(guide_query_embeddings, dtype=np.float32)
-    gc = c if guide_corpus_embeddings is None else np.asarray(guide_corpus_embeddings, dtype=np.float32)
-    if (gq.ndim != 2 or gc.ndim != 2 or len(gq) != len(q) or len(gc) != len(c)
-            or gq.shape[1] != gc.shape[1] or not np.isfinite(gq).all() or not np.isfinite(gc).all()):
-        raise ValueError("Guide embeddings have invalid shapes or nonfinite values")
+    gq, gc = (q, c) if guide_query_embeddings is None else validate_embedding_pair(
+        guide_query_embeddings, guide_corpus_embeddings, label="Guide")
+    if len(gq) != len(q) or len(gc) != len(c):
+        raise ValueError("Guide embeddings must match the query/corpus row counts")
+
+    def guide_score(query_index, doc_index):
+        with np.errstate(over="ignore", invalid="ignore"):
+            score = float(gq[query_index] @ gc[doc_index])
+        if not math.isfinite(score):
+            raise ValueError("Guide similarities must be finite")
+        return score
     relevant = known_positives(pairs)
     index = {text: i for i, text in enumerate(corpus)}
     if any(text not in index for values in relevant.values() for text in values):
@@ -49,8 +57,10 @@ def mine_negatives(pairs, corpus, query_embeddings, corpus_embeddings, num_negat
             i = start + offset
             pair = pairs[i]
             gold = relevant[pair["query"]]
-            positive_score = min(float(gq[i] @ gc[index[text]]) for text in gold)
+            positive_score = min(guide_score(i, index[text]) for text in gold)
             threshold = positive_score - abs(positive_score) * relative_margin - absolute_margin
+            if not math.isfinite(threshold):
+                raise ValueError("Guide filtering threshold must be finite")
             negatives, details = [], []
             for rank in range(range_min, len(ranked)):
                 doc_index = int(ranked[rank])
@@ -58,13 +68,13 @@ def mine_negatives(pairs, corpus, query_embeddings, corpus_embeddings, num_negat
                 if text in gold:
                     stats["filtered_known_positive"] += 1
                     continue
-                guide_score = float(gq[i] @ gc[doc_index])
-                if guide_score > threshold:
+                candidate_score = guide_score(i, doc_index)
+                if candidate_score > threshold:
                     stats["filtered_margin"] += 1
                     continue
                 negatives.append(text)
                 details.append({"id": document_id(text), "rank": rank,
-                                "score": float(row_scores[rank]), "guide_score": guide_score})
+                                "score": float(row_scores[rank]), "guide_score": candidate_score})
                 if len(negatives) == num_negatives:
                     break
             stats["selected"] += len(negatives)
