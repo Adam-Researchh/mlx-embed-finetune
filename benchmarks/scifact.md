@@ -74,6 +74,11 @@ does not detect every kind of leakage. Use the validation split for checkpoint
 selection; never pass the final test split as `--eval-pairs` to `train.py`.
 
 For an ablation, fix the base revision, splits, sequence limits and training
-budget; compare standard InfoNCE with mined/filtered negatives and then hardness
-weighting over multiple seeds. Report held-out retrieval metrics and uncertainty
+budget; compare standard InfoNCE with mining/filtering, multi-positive labels,
+contrastive batch size, hardness weighting and ranking distillation in separate
+ablations over multiple seeds. Report held-out retrieval metrics and uncertainty
 alongside memory and training cost before changing defaults.
+
+See [evaluation semantics](../docs/evaluation.md) for repeated-query weighting
+and binary relevance, and [validation coverage](../docs/validation.md) for the
+correctness checks behind the evaluator.

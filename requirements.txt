@@ -1,6 +1,6 @@
-# Verified working set — smoke-tested end to end on 2026-08-25, macOS / Apple Silicon.
-# Floors are the lowest versions this pipeline is known to work with; the exact
-# versions in the CI smoke test are recorded in .github/workflows/smoke.yml.
+# Dependency floors, not a lockfile. See docs/validation.md for recorded
+# local and CI configurations. CI resolves compatible releases and records
+# their versions in the workflow log; not every version combination is tested.
 mlx>=0.29.3
 mlx-lm>=0.29.1
 mlx-embeddings>=0.1.0
@@ -9,6 +9,6 @@ sentencepiece>=0.2.0
 numpy>=1.26
 
 # NOTE: train.py imports `LoRALinear` from `mlx_lm.tuner.lora`, which is an
-# internal path in mlx-lm rather than a public API. It is verified working on
-# mlx-lm 0.29.1 and 0.31.3. The CI smoke test exists to catch the day that
-# changes.
+# internal path in mlx-lm rather than a public API. The October feature
+# release was validated with mlx-lm 0.31.3 locally and 0.32.0 in CI. The smoke
+# tests check this integration for upstream drift.

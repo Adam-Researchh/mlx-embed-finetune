@@ -1,108 +1,103 @@
-# Benchmark Results
+# Benchmark results
 
-## Summary
+The recorded measurements answer different questions: memory use during a
+synthetic gradient computation, retrieval quality of an untuned baseline, and
+elapsed time in an older training workflow. Use the settings and scope attached
+to each measurement when comparing a new run.
 
-This pipeline targets a practical Apple Silicon problem: encoder fine-tuning workflows that spend hours on CPU-heavy or poorly accelerated PyTorch paths despite high-end integrated GPU hardware.
+| Measurement | Result | Evidence |
+|---|---|---|
+| Gradient cache, October 11, 2026 | Peak MLX allocation 5.060 → 0.400 GiB; single forward/backward time 0.350 → 0.933 s | [Recipe](gradient-cache.md), [raw results](gradient-cache-2026-10-11.json) |
+| Untuned MiniLM on SciFact, September 24, 2026 | nDCG@10 0.6455; MRR@10 0.6049; Recall@10 0.7850 | [Recipe](scifact.md), [raw results](scifact-baseline-2026-09-24.json) |
+| Original BGE-M3 training workflow | 56 minutes with MLX versus approximately 6–8 hours for the recorded PyTorch workflow | [Historical record below](#historical-bge-m3-workflow) |
 
-The MLX version moves the training loop onto Metal and makes much better use of unified memory.
+The cache measurement demonstrates a memory/compute tradeoff on its stated
+workload. The SciFact result establishes a baseline for the evaluator. Neither
+measurement establishes a retrieval-quality gain from fine-tuning. Correctness
+and model coverage are documented separately in [validation](../docs/validation.md).
 
-## Measured Comparison
+## Gradient cache measurement
 
-| Method | Hardware | Dataset | Epochs | Time | GPU Usage |
+The synthetic workload uses 32 queries, 128 candidate documents, 128 tokens per
+input, LoRA rank 8, multiple positives and ranking KL. Both runs disable dropout
+for a direct comparison. On an M1 Ultra with 128 GiB unified memory and MLX
+0.32.2, encoding chunks of four reduced peak MLX tensor allocation by **92.1%**.
+Loss differed by 4.77e-7; separate tests verify every-parameter gradient agreement.
+
+The recorded times are single forward/backward passes in separate processes.
+They include model allocations but exclude Python memory and optimizer state/
+updates. See [the complete measurement](gradient-cache.md) before extrapolating
+to another sequence length, candidate pool, model or training loop.
+
+## SciFact retrieval baseline
+
+The full corpus contains 5,183 documents and the test split contains 300 queries.
+The recorded model is `mlx-community/all-MiniLM-L6-v2-bf16`, using empty prefixes
+and a 256-token maximum length. Titles are prepended to abstracts; relevance is
+binary and exact duplicate document text is collapsed.
+
+| Dimensions | nDCG@10 | MRR@10 | Recall@10 |
+|---|---:|---:|---:|
+| 384 | 0.6455 | 0.6049 | 0.7850 |
+| 128 | 0.5991 | 0.5544 | 0.7583 |
+| 64 | 0.4839 | 0.4450 | 0.6145 |
+
+Smaller vectors are truncations of the stock model with re-normalization. The
+model was not newly trained with Matryoshka loss for this measurement. Dataset
+and model hashes, versions and commands are in [the SciFact recipe](scifact.md).
+
+## Historical BGE-M3 workflow
+
+These observations were recorded before the August 25, 2026 verification pass.
+That pass did not repeat the timing comparison. The figures describe the
+original workflow and do not establish a general speed ratio against current,
+optimized PyTorch/MPS implementations.
+
+| Method | Hardware | Dataset | Epochs | Time | GPU usage |
 |---|---|---:|---:|---:|---:|
-| PyTorch + sentence-transformers | M1 Ultra 128GB | 9K pairs | 3 | ~6-8 hours | <5% |
-| **MLX encoder fine-tuning** | M1 Ultra 128GB | 9K pairs | 3 | **56 minutes** | **78%** |
+| PyTorch + sentence-transformers | M1 Ultra 128GB | 9K pairs | 3 | approximately 6–8 hours | below 5% |
+| MLX embedding fine-tuning | M1 Ultra 128GB | 9K pairs | 3 | 56 minutes | approximately 78% |
 
-## Dry-Run Measurements
+The original one-batch validation notes recorded 2.1 s forward/backward at batch
+size 16, 7.6 pairs/s, and approximately 5–6 GB unified memory. The original notes
+are not a version-pinned, command-complete speed benchmark; use these figures as
+historical context rather than a current framework ranking.
 
-Measured during a one-batch validation pass:
+## Historical verification on August 25
 
-- Forward + backward: **2.1s/batch**
-- Batch size: **16**
-- Throughput: **7.6 pairs/sec**
-- Unified memory footprint: **~5-6GB**
+Recorded stack: MLX 0.32.2, mlx-lm 0.31.3, mlx-embeddings 0.1.0, transformers
+5.15.1, Python 3.14, macOS/Apple Silicon.
 
-Notes:
+That correctness pass fixed quantized layers being skipped during adapter
+selection, made zero adapted/trainable parameters an error, restored the best
+checkpoint before merge, and included missing BERT vocabulary files in exports.
+See [the changelog](../CHANGELOG.md) for subsequent correctness work.
 
-- Early steps include MLX compilation and warmup overhead
-- Throughput is expected to improve modestly after warmup
-- Actual runtime depends on sequence lengths, batch size, and model choice
+The historical MiniLM batch-of-four diagnostic at temperature 0.05 recorded
+loss near 0.0001 and gradient norm near 4e-4 on easy in-batch contrasts. Easy
+negatives can provide little training signal; the observation does not imply
+that every dataset requires the same negative-mining recipe.
 
-## Why The Speedup Happens
+### Historical architecture checks
 
-1. **Metal-native execution** through MLX instead of a weakly utilized PyTorch encoder path on Apple Silicon
-2. **Unified memory** reduces friction between compute and model state
-3. **LoRA fine-tuning** updates a tiny subset of parameters instead of the full encoder
-4. **LoRA on Q/V only** keeps the backward pass narrow
+The earlier fixed block walk did not cover ModernBERT's fused projections or
+decoder-style naming. Path-based presets enabled the following checks:
 
-## Practical Takeaway
-
-On the measured M1 Ultra setup, this reduced a multi-hour encoder fine-tuning workflow to under an hour while substantially increasing GPU utilization.
-
-
-## Verification, 2026-08-25
-
-Re-verified on the current stack after five months of upstream movement. No
-timing re-run was performed, so the M1 Ultra numbers above are unchanged and
-still date from the original BGE-M3 run.
-
-**Stack tested:** mlx 0.32.2 · mlx-lm 0.31.3 · mlx-embeddings 0.1.0 ·
-transformers 5.15.1 · Python 3.14 · macOS / Apple Silicon.
-
-**Result:** the pipeline still runs — but two silent failures were found and
-fixed, both of which produced a *confident-looking* run that trained nothing.
-
-| Finding | Symptom before the fix |
-|---|---|
-| `QuantizedLinear` is not a subclass of `nn.Linear` | Every projection in a 4/6/8-bit model was skipped. The script printed `Applied LoRA to 0 layers`, continued through optimizer setup, and died several steps later inside MLX with `[grad] Must specify at least one argument`. |
-| Zero adapted layers was not an error | The `0 layers` / `0.000M trainable` lines were printed as ordinary status output. Nothing in the pipeline treated "nothing to train" as a failure. |
-
-Both now raise `NoAdaptedLayersError` at the point of failure, naming the
-modules that *were* found. The dry run additionally asserts a non-zero gradient
-norm, and CI asserts that a bogus `--target-modules` exits non-zero.
-
-**Also corrected:** the merged export previously fused whatever weights the
-final step produced, even when an earlier checkpoint had a better eval loss,
-and the tokenizer file list omitted `vocab.txt` — so a merged BERT-family
-export shipped without its vocabulary.
-
-### Loss signal without hard negatives
-
-Measured on `mlx-community/all-MiniLM-L6-v2-bf16`, batch of 4, τ=0.05:
-embeddings arrive already L2-normalized, the diagonal logit is 20.0 and
-off-diagonal logits are ~3.8. Loss is **0.0001** and the gradient norm is
-**~4e-4**. That is not a bug — it is a well-trained encoder finding random
-in-batch negatives trivial, and it is the concrete reason explicit hard
-negatives were added.
-
-
-## Architecture coverage, 2026-08-25
-
-The original pipeline walked one hardcoded structure —
-`encoder.layer[*].attention.self.query|value` — which is the 2019 BERT block
-shape. Nothing released since fits it. Targeting is now done by matching module
-*paths*, with auto-detection across three families. Verified on this machine,
-each with a live non-zero gradient:
-
-| Model | Preset | Modules adapted | Trainable | Grad norm |
+| Model | Preset | Adapted modules | Trainable parameters | Gradient norm |
 |---|---|---:|---:|---:|
-| all-MiniLM-L6-v2-bf16 | `bert/xlm-roberta` | 12 | 0.074M | 4.3e-4 |
-| all-MiniLM-L6-v2-bf16, `all-linear` | — | 36 | 0.332M | 7.4e-4 |
-| nomicai-modernbert-embed-base-bf16 | `modernbert` | 44 | 0.811M | 8.6e-2 |
-| nomicai-modernbert-embed-base-4bit | `modernbert` (QLoRA) | 44 | 0.811M | 2.3e-1 |
-| embeddinggemma-300m-4bit | `decoder-style` (QLoRA) | 48 | 0.492M | 2.6e-1 |
+| MiniLM bf16 | `bert/xlm-roberta` | 12 | 0.074M | 4.3e-4 |
+| MiniLM bf16, all-linear | `all-linear` | 36 | 0.332M | 7.4e-4 |
+| Nomic ModernBERT bf16 | `modernbert` | 44 | 0.811M | 8.6e-2 |
+| Nomic ModernBERT 4-bit | `modernbert` | 44 | 0.811M | 2.3e-1 |
+| EmbeddingGemma 300M 4-bit | `decoder-style` | 48 | 0.492M | 2.6e-1 |
 
-Two incompatibilities had to be handled, not one:
+These are execution diagnostics. A larger gradient norm or a larger adapted
+parameter count does not by itself show improved retrieval quality.
 
-1. **Block structure.** ModernBERT fuses QKV into a single `attn.Wqkv`
-   projection, so `--target-modules query,value` is not merely wrong there — it
-   is inexpressible.
-2. **Forward signature.** `mlx-embeddings` is not uniform: encoder models take
-   `input_ids`, decoder-style embedders take `inputs`. The model is inspected
-   once at load and the call adapted, rather than hardcoding one family's
-   convention.
+## Add a comparable result
 
-Adapting the same MiniLM with `all-linear` instead of Q/V-only triples the
-adapted module count and raises the gradient norm ~1.7x, consistent with the
-QLoRA paper's finding that low rank across all linear layers beats high rank
-across a couple.
+Record the command, model revision, dataset hash/split, hardware, package
+versions, precision, token lengths, query/candidate counts, warmup and repeat
+protocol. Distinguish tensor allocation from total process memory, individual
+passes from steady-state throughput, and base-model scores from tuned-model
+improvements. Follow [the evaluation guide](../docs/evaluation.md) for ablations.
