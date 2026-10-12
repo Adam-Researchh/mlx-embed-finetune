@@ -23,19 +23,28 @@ def positive_cross_entropy(similarities, positives, valid, temperature, hardness
     return -mx.mean(mx.sum(positive_log_probs, axis=1) / mx.sum(positives, axis=1))
 
 
+def _ranking_log_probs(scores, scored, temperature):
+    scores = mx.where(scored, scores.astype(mx.float32), -float("inf"))
+    # Center before temperature scaling: an arbitrary teacher-score offset
+    # must neither overflow nor erase the log normalizer in float32.
+    logits = (scores - mx.max(scores, axis=1, keepdims=True)) / temperature
+    return logits - mx.logsumexp(logits, axis=1, keepdims=True)
+
+
 def ranking_kl(similarities, scores, scored, temperature):
     """KL(teacher || student) on each query's fixed scored candidate group.
 
     Unscored in-batch candidates still participate in the contrastive loss,
     but do not receive invented teacher labels. No temperature-squared factor.
     """
-    teacher_logits = mx.where(scored, scores / temperature, -float("inf"))
-    student_logits = mx.where(scored, similarities / temperature, -float("inf"))
-    teacher_logp = teacher_logits - mx.logsumexp(teacher_logits, axis=1, keepdims=True)
-    student_logp = student_logits - mx.logsumexp(student_logits, axis=1, keepdims=True)
-    # Avoid 0 * (-inf - -inf) in sparse candidate groups.
-    delta = mx.where(scored, teacher_logp, 0.0) - mx.where(scored, student_logp, 0.0)
-    return mx.mean(mx.sum(mx.stop_gradient(mx.exp(teacher_logp)) * delta, axis=1))
+    teacher_logp = mx.stop_gradient(_ranking_log_probs(scores, scored, temperature))
+    student_logp = _ranking_log_probs(similarities, scored, temperature)
+    teacher_probability = mx.exp(teacher_logp)
+    # Use the 0 * log(0) = 0 limit for unscored entries and teacher
+    # probabilities that underflow to zero with widely separated scores.
+    active = scored & (teacher_probability > 0)
+    delta = mx.where(active, teacher_logp, 0.0) - mx.where(active, student_logp, 0.0)
+    return mx.mean(mx.sum(teacher_probability * delta, axis=1))
 
 
 def embedding_objective(q, c, positives, valid, temperature=.05, hardness=0.0,

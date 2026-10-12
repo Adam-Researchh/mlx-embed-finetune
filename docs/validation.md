@@ -19,6 +19,15 @@ unit/reference tests, real-model checks, full workflows and separate benchmarks.
 
 Test counts describe that release. The commands below run the current suite.
 
+## Independent adversarial follow-up
+
+The [October 12 audit](adversarial-audit-2026-10-12.md) used a fresh reviewer,
+independent numerical references and additional real-model probes. It found
+and fixed a ranking-distillation numerical bug; all **131 local tests** pass
+with real-model checks enabled. Four new regression cases fail before the fix.
+The audit also isolated an existing upstream quantized EmbeddingGemma padding
+defect and records that model's current limitation.
+
 ## What the tests establish
 
 | Area | Checks |

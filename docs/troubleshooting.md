@@ -85,6 +85,11 @@ framework or converter needs separate verification.
 
 ## Unexpected retrieval scores
 
+For `embeddinggemma-300m-4bit` on the audited `mlx-embeddings==0.1.0` stack,
+check the [known padding defect](models.md#known-quantized-embeddinggemma-limitation).
+Changing a padded batch can change that model's vectors even before training.
+Use the verified MiniLM path pending an upstream correction and retest.
+
 Match the checkpoint's prompt recipe, model revision, sequence limit,
 normalization and output dimensions. For local tuned exports, evaluation can
 read saved prefixes; malformed metadata raises. Other settings, including
