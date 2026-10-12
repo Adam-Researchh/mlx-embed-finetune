@@ -81,6 +81,15 @@ same encoding chunks and random masks; changing batch shapes can change masks.
 The caller's random stream advances once through encoding, not twice. Current
 encoder forwards must be stateless apart from RNG; BatchNorm models are rejected.
 
+`--cache-forward-mode autodiff` enables an experimental cache pass that follows
+MLX's differentiated encoder forward path. It can reduce the numerical gap
+between the initial cached embeddings and their later replay in low precision.
+It requires a positive `--cache-chunk-size`, preserves model dtypes, and does
+not change the loss. The default `plain` keeps the existing cache behavior.
+This mode has extra tracing/forward cost and is supported by a
+[numerical benchmark and prior-work review](replay-consistency.md), not a claim
+of improved retrieval quality. It does not fix model padding or pooling bugs.
+
 Memory still grows with the stored embeddings, token inputs, masks, teacher
 scores, and embedding gradients. `--loss-chunk-size` bounds the score matrix
 used by each cached loss-gradient computation. Validation also respects the

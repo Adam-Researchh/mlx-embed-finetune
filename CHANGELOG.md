@@ -6,6 +6,13 @@ the latest training-feature release.
 
 ## 2026-10-12
 
+Added experimental `--cache-forward-mode autodiff`: the cache pass evaluates
+the differentiated encoder forward and discards its unused backward graph,
+reducing measured forward/replay numerical discrepancies without promoting
+model precision. Default cache behavior remains `plain`. The
+[research record](docs/replay-consistency.md) includes prior work, explicit
+novelty limits and a reproducible benchmark; retrieval gains are unproven.
+
 An [independent adversarial follow-up](docs/adversarial-audit-2026-10-12.md)
 stabilized ranking KL against large common teacher-score offsets and extreme
 finite scores. Four new regression cases cover incorrect gradients and NaNs;

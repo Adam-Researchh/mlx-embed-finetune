@@ -55,7 +55,8 @@ def objective_for(batch, hardness=0, dims=None, distill=0):
 
 @pytest.mark.parametrize("multi,mrl,hardness,distill,dropout", list(itertools.product(
     (False, True), (False, True), (0, 2), (0, .3), (0, .2))))
-def test_cached_loss_and_every_parameter_gradient_match_reference(multi, mrl, hardness, distill, dropout):
+@pytest.mark.parametrize("cache_forward_mode", ["plain", "autodiff"])
+def test_cached_loss_and_every_parameter_gradient_match_reference(multi, mrl, hardness, distill, dropout, cache_forward_mode):
     mx.random.seed(17)
     model = DropoutEncoder(dropout)
     model.train()
@@ -75,7 +76,8 @@ def test_cached_loss_and_every_parameter_gradient_match_reference(multi, mrl, ha
     mx.eval(expected, expected_grads)
     after_reference = capture_rng()
     restore_rng(before)
-    actual, grads = cached_value_and_grad(model, encode, q_chunks, c_chunks, loss, loss_chunk_size=2)
+    actual, grads = cached_value_and_grad(model, encode, q_chunks, c_chunks, loss, loss_chunk_size=2,
+                                         cache_forward_mode=cache_forward_mode)
     mx.eval(actual, grads)
     assert float(actual.item()) == pytest.approx(float(expected.item()), rel=2e-5, abs=2e-6)
     assert capture_rng() == after_reference
@@ -245,14 +247,18 @@ def test_all_features_run_through_training_and_checkpoint_export(tmp_path, monke
                        for i, doc in enumerate(docs)]} for q, docs in teacher_groups(pairs).items()]]
     path.write_text("\n".join(map(json.dumps, records)))
     args.teacher_scores, args.distill_weight = str(path), .2
+    if cache:
+        args.cache_forward_mode = "autodiff"
     train.train(args)
     assert calls and exports[0]["multi_positive"]
     assert exports[0]["cache_chunk_size"] == cache
+    assert exports[0]["cache_forward_mode"] == ("autodiff" if cache else "plain")
     assert exports[0]["distill_weight"] == .2
     assert exports[0]["teacher_scores_sha256"] == file_digest(path)
 
 
 @pytest.mark.parametrize("flags", [["--cache-chunk-size", "-1"], ["--loss-chunk-size", "0"],
+                                   ["--cache-forward-mode", "autodiff"],
                                    ["--distill-weight", ".1"], ["--teacher-scores", "file"],
                                    ["--distill-temperature", "nan"], ["--distill-weight", "-1"]])
 def test_invalid_feature_combinations_fail(flags):

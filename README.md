@@ -18,6 +18,7 @@ These features are opt-in and preserve a single-vector serving interface.
 | [Design rationale](docs/design-rationale.md) | Why the objectives, caching and serving choices work this way |
 | [Model coverage](docs/models.md) | Tested models, prompt requirements and support boundaries |
 | [Validation](docs/validation.md) | Test coverage, tested dependency stacks and release evidence |
+| [Replay consistency experiment](docs/replay-consistency.md) | An opt-in autodiff cache pass, numerical evidence and its novelty limits |
 | [Troubleshooting](docs/troubleshooting.md) | Input, memory, gradient, cache and export failures |
 | [Benchmark results](benchmarks/results.md) | Measured memory, retrieval baselines and historical timings |
 | [Roadmap](ROADMAP.md) | Remaining work and the evidence required to adopt it |

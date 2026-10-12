@@ -1,4 +1,4 @@
-"""Exact gradient caching for stateless embedding forwards on MLX.
+"""Gradient caching for stateless embedding forwards on MLX.
 
 Encode without a backward graph, differentiate the shared embedding loss, then
 replay encoder chunks with cached embedding gradients and identical randomness.
@@ -30,18 +30,40 @@ def restore_rng(seed):
     mx.random.seed(seed)
 
 
+def autodiff_forward(model, encode, tokens):
+    """Materialize the differentiated forward without evaluating its backward.
+
+    MLX can select different low-precision forward kernels under autodiff.
+    Tracing a scalar depending on the entire embedding selects that path; the
+    lazy, unused parameter-gradient graph is discarded before evaluation.
+    """
+    def forward(m):
+        embeddings = encode(m, tokens)
+        return mx.sum(embeddings), embeddings
+
+    (_, embeddings), unused_grads = nn.value_and_grad(model, forward)(model)
+    del unused_grads
+    embeddings = mx.stop_gradient(embeddings)
+    mx.eval(embeddings)
+    return embeddings
+
+
 def cached_value_and_grad(model, encode, query_chunks, candidate_chunks, loss_for_rows,
-                          loss_chunk_size=64):
+                          loss_chunk_size=64, cache_forward_mode="plain"):
     """loss_for_rows(q, c, start, stop) returns the mean loss for those query rows.
 
     Encoder activation memory is bounded by an encoding chunk. Embeddings,
     token inputs, labels and embedding gradients remain resident. Each loss
     gradient graph holds at most loss_chunk_size x candidate_count logits.
+    ``autodiff`` cache forwards opt into the same differentiated encoder path
+    used during replay, without promoting model precision.
     """
     if not query_chunks or not candidate_chunks or loss_chunk_size < 1:
         raise ValueError("Nonempty encoding chunks and a positive loss chunk size are required")
     if any(isinstance(module, nn.BatchNorm) for _, module in model.named_modules()):
         raise ValueError("Gradient caching does not support stateful BatchNorm forwards")
+    if cache_forward_mode not in ("plain", "autodiff"):
+        raise ValueError("cache_forward_mode must be 'plain' or 'autodiff'")
     initial_rng = capture_rng()
     after_cache_rng = initial_rng
     states, embeddings = [], []
@@ -49,7 +71,8 @@ def cached_value_and_grad(model, encode, query_chunks, candidate_chunks, loss_fo
     try:
         for tokens in chunks:
             states.append(capture_rng())
-            out = mx.stop_gradient(encode(model, tokens))
+            out = (autodiff_forward(model, encode, tokens) if cache_forward_mode == "autodiff"
+                   else mx.stop_gradient(encode(model, tokens)))
             mx.eval(out)
             if out.ndim != 2:
                 raise ValueError("Gradient caching requires one embedding vector per input")

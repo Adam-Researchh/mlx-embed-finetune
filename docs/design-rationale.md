@@ -97,6 +97,10 @@ This is mathematical gradient equivalence, with finite-precision tolerances
 in practice. Quantized kernels can produce different rounding under autodiff;
 the [audit](adversarial-audit-2026-10-12.md) records additional model-specific
 measurements and a separate upstream padding limitation.
+An experimental [autodiff cache pass](replay-consistency.md) addresses the
+measured forward-path discrepancy by evaluating the differentiated encoder
+forward while discarding its unused backward graph. It preserves model
+precision and the existing loss; `plain` remains the default.
 
 Stored embeddings, token inputs, masks, teacher-score matrices and embedding
 gradients still consume memory. The cache trades extra encoding computation

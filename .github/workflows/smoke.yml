@@ -134,7 +134,7 @@ jobs:
             --dims 128,64 --json-out /tmp/ci-eval.json
           test -f /tmp/ci-eval.json
 
-      - name: Export parity — bf16 and QLoRA
+      - name: Model parity — export and autodiff cache forwards
         env:
           RUN_MODEL_TESTS: "1"
         run: python -m pytest -q tests/test_export.py
@@ -170,6 +170,7 @@ jobs:
             --train-pairs /tmp/ci-multi.jsonl --eval-pairs example_data/eval.jsonl \
             --model mlx-community/all-MiniLM-L6-v2-4bit \
             --multi-positive --batch-size 8 --cache-chunk-size 3 --loss-chunk-size 3 \
+            --cache-forward-mode autodiff \
             --grad-accum-steps 2 --matryoshka-dims 384,128,64 --hardness-strength 2 \
             --teacher-scores /tmp/ci-teacher.jsonl --distill-weight 0.2 \
             --lora-dropout 0.1 --epochs 1 --eval-every 3 --best-metric ndcg_at_10 \

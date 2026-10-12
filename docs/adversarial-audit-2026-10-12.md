@@ -40,6 +40,12 @@ temperatures `0.03`, `0.1`, `1`, and `10`. Maximum absolute differences were
 
 **Confirmed before adapters, training, or gradient caching.**
 
+A subsequent priority check found the same mechanism in
+[upstream issue 72](https://github.com/Blaizzy/mlx-embeddings/issues/72), reported
+on August 23, 2026, with a proposed fix in
+[PR 73](https://github.com/Blaizzy/mlx-embeddings/pull/73). Our audit is an
+independent reproduction and measurement, not the first discovery of this bug.
+
 On `mlx-embeddings==0.1.0`, MLX `0.32.2`, and mlx-lm `0.31.3`, the untouched
 `mlx-community/embeddinggemma-300m-4bit` model embeds a short text differently
 when encoded alone versus in a padded batch with a longer text. In the probe,
