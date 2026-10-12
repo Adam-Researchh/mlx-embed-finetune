@@ -10,6 +10,7 @@ Run commands from the repository root and choose fresh output paths.
 | [BEIR preparation](prepare_beir.py) | Convert local BEIR files into pair/corpus JSONL with binary relevance |
 | [Cache measurement utility](cache_memory.py) | Record loss, gradient norm, peak MLX allocation and one-pass time |
 | [Cache replay consistency](../docs/replay-consistency.md) | Compare plain and autodiff cache forwards against matched gradients, with raw multi-seed measurements |
+| [SciFact cache ablation](../docs/scifact-cache-ablation.md) | Test multi-step gradient fidelity and held-out retrieval using paired training runs |
 
 Raw JSON files are dated measurements, not promises for other configurations.
 [Validation coverage](../docs/validation.md) records correctness tests separately.

@@ -8,9 +8,12 @@ quality and deployability. This is a prioritized direction, not a release schedu
 ## Validate quality improvements
 
 The experimental [autodiff cache pass](docs/replay-consistency.md) has numerical
-parity evidence. Its next milestones are independent hardware/version
-replication and held-out retrieval ablations. Its narrow implementation idea
-is a research candidate; global priority and quality benefits are unproven.
+parity evidence. A [three-seed SciFact pilot](docs/scifact-cache-ablation.md)
+confirmed improved numerical fidelity without a demonstrated retrieval gain;
+plain caching remains the default. Next milestones are independent
+hardware/version replication and longer, separately designed retrieval
+experiments. Its narrow implementation idea is a research candidate; global
+priority and quality benefits are unproven.
 
 Run controlled ablations on held-out domain data and public retrieval tasks.
 Separate the effect of mining, positive labels, batch size, hardness, Matryoshka

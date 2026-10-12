@@ -185,6 +185,25 @@ Run with `python -m benchmarks.replay_consistency`. See the
 | `--dropout` | 0.15 | LoRA dropout probability |
 | `--output` | required | New JSON report path |
 
+## SciFact cache pilot utilities
+
+These commands implement a fixed experimental protocol rather than a general
+hyperparameter search. See [the protocol and results](scifact-cache-ablation.md).
+Generated directories and reports must be new.
+
+| Command | Flag | Default | Meaning |
+|---|---|---|---|
+| `python -m benchmarks.cache_ablation_data` | `--data-dir` | required | Extracted BEIR SciFact directory |
+| Same | `--output-dir` | required | New prepared-data directory |
+| `python -m benchmarks.scifact_cache_ablation` | `--data-dir` | required | Prepared directory with manifest |
+| Same | `--output-dir` | required | New run directory |
+| Same | `--arm` | required | `baseline`, `reference`, `plain`, `autodiff`, or `float32` |
+| Same | `--seed` | 41 | Paired training seed; the recorded pilot uses 41, 42 and 43 |
+| `python -m benchmarks.summarize_cache_ablation` | `--runs-dir` | required | Directory containing all named runs |
+| Same | `--manifest` | required | Exact preparation manifest |
+| Same | `--output` | required | New summary JSON path |
+| Same | `--per-query-output` | required | New per-query JSONL path |
+
 ## Important combinations
 
 - `--batch-size` sets a shared contrastive pool; `--grad-accum-steps` combines
