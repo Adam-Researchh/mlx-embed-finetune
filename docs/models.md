@@ -13,7 +13,7 @@ normalization and export/reload behavior.
 | `mlx-community/all-MiniLM-L6-v2-4bit` | BERT, `bert/xlm-roberta` | 12 | QLoRA training/export/reload, per-layer quantization configuration, cache parity and the full combined-feature workflow |
 | `mlx-community/nomicai-modernbert-embed-base-bf16` | ModernBERT, `modernbert` | 44 | CI forward/backward checks and offline teacher scoring |
 | `mlx-community/nomicai-modernbert-embed-base-4bit` | ModernBERT, `modernbert` | 44 | Local combined-feature forward/backward check with cache, multi-positive loss, distillation, MRL, hardness and dropout |
-| `mlx-community/embeddinggemma-300m-4bit` | Gemma 3, `decoder-style` | 48 | CI forward/backward check and local combined-feature check |
+| `mlx-community/embeddinggemma-300m-4bit` | Gemma 3, `decoder-style` | 48 | Execution checks pass, but an upstream padding defect is confirmed; see the limitation below |
 | `mlx-community/bge-m3-mlx-fp16` | XLM-RoBERTa, `bert/xlm-roberta` | 48 | Original training workflow and historical measurements; not the current full export-parity CI fixture |
 
 Coverage is recorded for the October 2026 release and earlier historical
@@ -21,6 +21,21 @@ measurements; see [validation](validation.md) and [benchmark results](../benchma
 A forward/backward check proves execution with a finite nonzero gradient. The
 full export-parity checks are currently concentrated on MiniLM. This table does
 not certify every quantization, long-context configuration or upstream revision.
+
+## Known quantized EmbeddingGemma limitation
+
+With `mlx-embeddings==0.1.0` and the audited MLX stack, the quantized Gemma
+implementation casts its padding mask to the packed embedding weight's
+`uint32` dtype. This removes the mask. The unchanged base model can therefore
+produce substantially different vectors for the same text when the other texts
+in its padded batch change. Gradient caching's smaller encoding chunks can
+expose the same defect, but it also occurs without training or caching.
+
+Treat this checkpoint as experimental on that stack. Use the verified MiniLM
+path for training and retrieval until upstream padding behavior is corrected
+and retested. A finite-gradient CI smoke test does not establish masking
+correctness. The [audit record](adversarial-audit-2026-10-12.md) contains the
+reproduction and distinguishes this issue from the fixed distillation bug.
 
 ## Adapter targeting
 

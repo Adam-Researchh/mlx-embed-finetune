@@ -93,6 +93,10 @@ key/seed APIs, and restores the caller's random stream after replay. Dropout
 parity is tested against an uncached backward pass using the same encoding
 chunks and masks. A separate deterministic test compares with an unsplit batch.
 BatchNorm models are rejected because their forward state can change on replay.
+This is mathematical gradient equivalence, with finite-precision tolerances
+in practice. Quantized kernels can produce different rounding under autodiff;
+the [audit](adversarial-audit-2026-10-12.md) records additional model-specific
+measurements and a separate upstream padding limitation.
 
 Stored embeddings, token inputs, masks, teacher-score matrices and embedding
 gradients still consume memory. The cache trades extra encoding computation
@@ -130,6 +134,10 @@ The file format can accept calibrated scores produced by an external reranker.
 This repository does not execute or calibrate that reranker. Temperature and
 distillation weight are experimental controls, not universal quality defaults.
 Teacher quality and label consistency must be evaluated on held-out retrieval.
+For numerical stability, each scored group is centered before temperature
+scaling and zero teacher-probability terms contribute zero to KL. A common
+score offset must not change the teacher distribution; extreme finite scores
+are covered by regression tests.
 
 Implementation: [teacher.py](../teacher.py), [cache validation](../training_data.py)
 and [ranking KL](../objectives.py). Research on soft-label contrastive distillation

@@ -141,6 +141,34 @@ def test_teacher_kl_improves_ranking_and_ignores_unscored_candidates():
     assert abs(ranking_kl(scores, scores, mask, .2).item()) < 1e-6
 
 
+@pytest.mark.parametrize("offset", [1e5, 1e7, 3e38])
+def test_teacher_kl_is_invariant_to_common_score_offsets(offset):
+    # Equal scores always mean a uniform teacher, regardless of their origin.
+    # An unscored extreme value must not affect the normalizing maximum.
+    student = mx.array([[.6, .4, -.9]])
+    teacher = mx.array([[offset, offset, 3e38]])
+    mask = mx.array([[True, True, False]])
+    loss, gradient = mx.value_and_grad(lambda x: ranking_kl(x, teacher, mask, .1))(student)
+    logits = np.array([.6, .4], dtype=np.float64) / .1
+    logp = logits - np.logaddexp.reduce(logits)
+    expected_loss = np.mean(-np.log(2) - logp)
+    expected_gradient = np.r_[(np.exp(logp) - .5) / .1, 0.][None, :]
+    assert loss.item() == pytest.approx(expected_loss, abs=1e-6)
+    np.testing.assert_allclose(np.array(gradient), expected_gradient, atol=2e-6)
+
+
+def test_teacher_kl_handles_finite_extreme_scores_and_zero_probability():
+    student = mx.array([[.6, .4, -.9]])
+    teacher = mx.array([[3e38, -3e38, 3e38]])
+    mask = mx.array([[True, True, False]])
+    loss, gradient = mx.value_and_grad(lambda x: ranking_kl(x, teacher, mask, .1))(student)
+    # The low-scoring teacher candidate has probability zero in float32.
+    expected_loss = np.logaddexp(0., -2.)
+    p = np.exp(-expected_loss)
+    assert loss.item() == pytest.approx(expected_loss, abs=1e-6)
+    np.testing.assert_allclose(np.array(gradient), [[(p - 1) / .1, (1 - p) / .1, 0]], atol=2e-6)
+
+
 def test_rng_roundtrip_after_random_stream_has_advanced():
     mx.random.seed(19)
     mx.eval(mx.random.normal(shape=(7,)))

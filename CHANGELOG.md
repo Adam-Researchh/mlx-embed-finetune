@@ -6,6 +6,13 @@ the latest training-feature release.
 
 ## 2026-10-12
 
+An [independent adversarial follow-up](docs/adversarial-audit-2026-10-12.md)
+stabilized ranking KL against large common teacher-score offsets and extreme
+finite scores. Four new regression cases cover incorrect gradients and NaNs;
+the local suite passes 131 tests. The audit also documents an existing upstream
+quantized EmbeddingGemma padding defect without claiming that execution smoke
+tests establish model correctness.
+
 [PR 3](https://github.com/Adam-Researchh/mlx-embed-finetune/pull/3) added:
 
 - Opt-in true multi-positive training with uniform positive targets and
