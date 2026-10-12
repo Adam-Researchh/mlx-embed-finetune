@@ -1,28 +1,20 @@
 #!/usr/bin/env python3
 """
-MLX embedding model fine-tuning with LoRA on Apple Silicon.
+Fine-tune single-vector embedding models with LoRA or QLoRA on Apple Silicon.
 
-Fine-tunes encoder-style embedding models such as BERT, XLM-RoBERTa and BGE
-variants using MLX on Metal.
+Supports explicit hard negatives, known-positive protection, opt-in uniform
+multi-positive supervision, gradient-cached contrastive batches, offline teacher
+ranking distillation, Matryoshka loss and optional hardness weighting. Gradient
+accumulation combines separate contrastive pools before an optimizer update.
 
-Features:
-- LoRA adapters on attention query/value projections (fp16/bf16 and quantized)
-- InfoNCE / MultipleNegativesRankingLoss with optional explicit hard negatives
-- False-negative masking for duplicate positives inside a batch
-- Optional Matryoshka (MRL) multi-dimension loss
-- Gradient accumulation for larger optimizer batches (same negative pool per micro-batch)
-- Decoupled weight-decay optimizer with warmup + cosine decay
-- Periodic evaluation, best-checkpoint tracking, and best-checkpoint export
-- LoRA checkpoint export and merged model export
-- Dry-run mode for throughput estimation
+Validation can select the checkpoint by loss or corpus retrieval metrics. The
+export contains merged MLX weights, tokenizer files and training provenance.
+Adapter checkpoints do not implement exact optimizer/RNG resume.
 
-Training data format (JSONL):
-    {"query": "...", "positive": "...", "negatives": ["...", "..."]}
-
-`negatives` is optional. When present it is used as explicit hard negatives in
-the loss, which is the strongest quality lever available here: with random
-in-batch negatives alone a well-trained base model often sits near zero loss
-and receives almost no gradient signal.
+Pair JSONL requires query and positive strings; optional positives/negatives
+lists add known relevant answers and explicit distractors. Defaults preserve
+one designated positive per row. See docs/training.md and docs/design-rationale.md
+for objective semantics, data preparation and the serving contract.
 """
 
 import argparse
@@ -961,7 +953,7 @@ def train(args):
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Fine-tune MLX encoder embedding models with LoRA on Metal",
+        description="Fine-tune single-vector MLX embedding models with LoRA on Apple Silicon",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -980,7 +972,7 @@ Examples:
                         default="loss", help="Metric used to select the best checkpoint")
     parser.add_argument("--save-every", type=int, default=100, help="Save adapters every N steps; 0 disables periodic saves")
     parser.add_argument("--hardness-strength", type=float, default=0.0,
-                        help="Detached cosine penalty on all negatives; 0 preserves standard InfoNCE")
+                        help="Detached cosine penalty on negatives; 0 disables weighting")
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Model path or repository (default: {DEFAULT_MODEL})")
     parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
     parser.add_argument("--batch-size", type=int, default=16, help="Queries per contrastive loss; with GradCache this can exceed the encoding chunk size")
@@ -1010,9 +1002,8 @@ Examples:
                              "list of module names (e.g. query,value), or regexes matched against "
                              "module paths (e.g. 'attn\\.(Wqkv|Wo)$')")
     parser.add_argument("--query-prefix", default="",
-                        help="Prefix prepended to every query, e.g. 'search_query: '. Current retrieval "
-                             "models (E5, BGE, nomic, Qwen3-Embedding, EmbeddingGemma) are pretrained with "
-                             "asymmetric prefixes; fine-tuning without them trains off-distribution.")
+                        help="Prefix prepended to every query, e.g. 'search_query: '. Use the selected "
+                             "checkpoint's prompt recipe; requirements vary between models.")
     parser.add_argument("--doc-prefix", default="",
                         help="Prefix prepended to every positive/negative document, e.g. 'search_document: '")
     parser.add_argument("--no-hard-negatives", action="store_true",

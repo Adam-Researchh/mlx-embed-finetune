@@ -34,6 +34,7 @@ single forward/backward timings rather than steady-state throughput averages.
 Reproduce in separate processes on Apple Silicon after installing requirements:
 
 ```bash
+mkdir -p outputs
 python -m benchmarks.cache_memory \
   --queries 32 --sequence-length 128 --output outputs/memory-uncached.json
 python -m benchmarks.cache_memory \
@@ -58,3 +59,7 @@ This is a wiring/correctness test on synthetic example data. Adoption as a
 quality default still requires a held-out multi-seed ablation on meaningful
 retrieval data. The existing SciFact recipe can evaluate such an experiment,
 with a separate validation split used for checkpoint selection.
+
+See [design rationale](../docs/design-rationale.md#separate-contrastive-batches-from-optimizer-batches)
+for the cache algorithm and [validation](../docs/validation.md) for the test
+record. The [training guide](../docs/training.md) explains the three batch controls.

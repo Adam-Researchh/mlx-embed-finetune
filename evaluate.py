@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Compare a base encoder model against a fine-tuned encoder model on a retrieval
-style evaluation.
+Evaluate single-vector MLX embedding models, optionally comparing base and tuned
+weights on the same corpus and relevance judgments.
 
 Input data format (JSONL):
     {"query": "...", "positive": "...", "negatives": ["...", "..."]}
@@ -12,10 +12,10 @@ Two views are reported:
    hard negatives? Reports accuracy and the mean positive-minus-negative
    cosine margin.
 2. Corpus retrieval — every positive and every negative from the whole file is
-   pooled into one corpus, then each query is ranked against all of it.
-   Reports Recall@k and MRR@10. This is much closer to how an embedding model
-   is actually used than a two-document comparison, and it is where a
-   fine-tune that only memorized easy contrasts will show its weakness.
+   pooled into one corpus, optionally extended by a separate corpus file.
+   Reports Recall@k, MRR@10 and binary nDCG@10 with multiple relevant answers.
+   Corpus retrieval measures ranking against the shared candidate collection;
+   use it alongside the pairwise diagnostic. See docs/evaluation.md.
 """
 
 import argparse
