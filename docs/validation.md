@@ -36,6 +36,13 @@ same-chunk ModernBERT/Gemma gradient comparisons without precision promotion,
 and records reproducible synthetic memory/timing measurements. These checks
 do not promote Gemma's separate padding behavior to verified correctness.
 
+The [SciFact cache ablation](scifact-cache-ablation.md) adds twelve fixed-budget
+training runs, three paired seeds, a common low-precision serving base, and
+independently checked retrieval statistics. It found no demonstrated retrieval
+gain for the autodiff mode. The current local suite passed **180 tests**;
+the added checks cover data leakage, transitive positive groups, paired
+bootstrap weighting, invalid pairings, optimizer updates and diagnostic RNG.
+
 | Area | Checks |
 |---|---|
 | Retrieval | Chunked rankings and scalar metrics match independent references across 150 randomized cases; ties, cutoffs and multiple positives are covered |

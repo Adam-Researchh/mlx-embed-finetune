@@ -6,6 +6,13 @@ the latest training-feature release.
 
 ## 2026-10-12
 
+Published a [paired SciFact cache ablation](docs/scifact-cache-ablation.md):
+twelve one-epoch runs, three seeds, full-corpus test retrieval, gradient and
+adapter-trajectory checks, float32 training control, and independently verified
+paired statistics. Improved numerical fidelity did not establish a retrieval
+gain; plain caching stays the default. Includes a reproducible harness, split
+leakage protection, raw per-query metrics and 180 passing local tests.
+
 Added experimental `--cache-forward-mode autodiff`: the cache pass evaluates
 the differentiated encoder forward and discards its unused backward graph,
 reducing measured forward/replay numerical discrepancies without promoting

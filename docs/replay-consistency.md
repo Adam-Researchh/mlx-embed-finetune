@@ -4,6 +4,11 @@
 priority is unverified.** This work does not establish a new contrastive loss,
 a new gradient-caching algorithm, a world first, or better retrieval quality.
 
+The subsequent [SciFact training pilot](scifact-cache-ablation.md) tested twelve
+matched training runs on this Mac. Numerical fidelity improved, but mean test
+nDCG@10 was 0.6587 for autodiff versus 0.6606 for plain caching, with an
+exploratory paired interval including zero. Plain remains the default.
+
 ## The question
 
 Can a gradient cache match an ordinary differentiated encoder's gradients in
@@ -189,7 +194,8 @@ Before promoting this technique beyond experimental status:
 - Reproduce on other Apple GPU generations and MLX versions, with pinned model
   snapshots and the same precision, sequence lengths and dropout conditions.
 - Measure longer training trajectories and held-out retrieval against plain
-  caching and a float32 control. Closer gradients need not improve retrieval.
+  caching and a float32 control beyond the completed 41-update SciFact pilot.
+  Closer gradients did not establish a retrieval gain in that first comparison.
 - Extend prior-work review and independent replication before using any
   priority claim. If an earlier equivalent implementation is found, credit it
   and retain this as a reproduction or engineering adaptation.

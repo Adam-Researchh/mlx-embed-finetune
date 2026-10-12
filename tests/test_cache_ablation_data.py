@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from benchmarks.cache_ablation_data import bm25_negatives, paired_bootstrap, positive_groups, split_rows
+from benchmarks.summarize_cache_ablation import ARMS, SEEDS, validate_pairing
 
 
 def test_grouping_closes_transitive_query_and_positive_links():
@@ -40,3 +41,28 @@ def test_bootstrap_preserves_query_weight_and_pairing():
     assert zeros["exploratory_95_interval"] == [0., 0.]
     with pytest.raises(ValueError):
         paired_bootstrap(values, [[0, 1], [1, 2, 3]])
+
+
+@pytest.mark.parametrize("field", ["query_order", "initial_adapter_sha256", "order_sha256", "rng"])
+def test_analysis_rejects_unpaired_runs(field):
+    from copy import deepcopy
+    baseline = {"protocol": {"budget": 1}, "manifest_sha256": "data", "source_sha256": {}, "versions": {},
+                "evaluation": {s: {"query_ids": ["a", "b"]} for s in ("test", "validation")}}
+    runs = {}
+    for arm in ARMS:
+        for seed in SEEDS:
+            report = deepcopy(baseline)
+            report.update(arm=arm, seed=seed)
+            report["training"] = {"initial_adapter_sha256": str(seed), "order_sha256": str(seed), "steps": 1,
+                                  "history": [{"rng_before": 1, "rng_after": 2}]}
+            runs[(arm, seed)] = report
+    validate_pairing(baseline, runs)
+    changed = runs[("autodiff", 41)]
+    if field == "query_order":
+        changed["evaluation"]["test"]["query_ids"].reverse()
+    elif field == "rng":
+        changed["training"]["history"][0]["rng_after"] = 3
+    else:
+        changed["training"][field] = "unpaired"
+    with pytest.raises(ValueError, match="Mismatched"):
+        validate_pairing(baseline, runs)
