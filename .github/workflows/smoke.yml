@@ -21,7 +21,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install numpy pytest
-      - run: python -m pytest -q tests/test_retrieval.py tests/test_mining.py tests/test_benchmark.py
+      - run: python -m pytest -q tests/test_retrieval.py tests/test_mining.py tests/test_benchmark.py tests/test_training_data.py
 
   smoke:
     # Apple Silicon runner for the Metal training and export integration tests.
@@ -150,6 +150,33 @@ jobs:
             --train-pairs /tmp/ci-mined.jsonl \
             --model mlx-community/all-MiniLM-L6-v2-4bit \
             --batch-size 4 --hardness-strength 2 --dry-run
+
+      - name: All features — score teacher, cache, multi-positive, distill, export
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          rows = [json.loads(line) for line in Path("example_data/train.jsonl").read_text().splitlines()]
+          for row in rows:
+              row["positives"] = [row["positive"] + " This passage explains the same topic."]
+          Path("/tmp/ci-multi.jsonl").write_text("\n".join(map(json.dumps, rows)) + "\n")
+          PY
+          python teacher.py \
+            --train-pairs /tmp/ci-multi.jsonl \
+            --model mlx-community/nomicai-modernbert-embed-base-bf16 \
+            --query-prefix "search_query: " --doc-prefix "search_document: " \
+            --batch-size 8 --output /tmp/ci-teacher.jsonl
+          python train.py \
+            --train-pairs /tmp/ci-multi.jsonl --eval-pairs example_data/eval.jsonl \
+            --model mlx-community/all-MiniLM-L6-v2-4bit \
+            --multi-positive --batch-size 8 --cache-chunk-size 3 --loss-chunk-size 3 \
+            --grad-accum-steps 2 --matryoshka-dims 384,128,64 --hardness-strength 2 \
+            --teacher-scores /tmp/ci-teacher.jsonl --distill-weight 0.2 \
+            --lora-dropout 0.1 --epochs 1 --eval-every 3 --best-metric ndcg_at_10 \
+            --seed 42 --output-dir /tmp/ci-combined
+          python evaluate.py \
+            --base-model mlx-community/all-MiniLM-L6-v2-4bit --tuned-model /tmp/ci-combined \
+            --eval-pairs example_data/eval.jsonl --dims 128,64 --json-out /tmp/ci-combined-eval.json
 
       - name: Guard — LoRA matching nothing must fail loudly
         env:
