@@ -76,7 +76,8 @@ def test_export_removes_stale_per_layer_quantization_overrides(tmp_path, monkeyp
 
 @pytest.mark.skipif(os.getenv("RUN_MODEL_TESTS") != "1", reason="set RUN_MODEL_TESTS=1 for model downloads")
 @pytest.mark.parametrize("suffix", ["bf16", "4bit"])
-def test_real_lora_cached_gradients_match_with_all_objectives(suffix):
+@pytest.mark.parametrize("cache_forward_mode", ["plain", "autodiff"])
+def test_real_lora_cached_gradients_match_with_all_objectives(suffix, cache_forward_mode):
     from grad_cache import cached_value_and_grad, capture_rng, restore_rng
     from training_data import make_batch, teacher_groups
     from test_cached_training import ROWS, objective_for
@@ -110,7 +111,8 @@ def test_real_lora_cached_gradients_match_with_all_objectives(suffix):
     mx.eval(expected, expected_grads)
     expected_rng = capture_rng()
     restore_rng(initial_rng)
-    actual, grads = cached_value_and_grad(model, encode, query_chunks, candidate_chunks, objective, 2)
+    actual, grads = cached_value_and_grad(model, encode, query_chunks, candidate_chunks, objective, 2,
+                                         cache_forward_mode)
     train.validate_training_step(actual, grads, require_nonzero=True)
     assert actual.item() == pytest.approx(expected.item(), abs=2e-4)
     assert capture_rng() == expected_rng
@@ -121,3 +123,55 @@ def test_real_lora_cached_gradients_match_with_all_objectives(suffix):
         expected_norm = np.linalg.norm(expected_array)
         if expected_norm > 1e-8:
             assert np.linalg.norm(actual_array - expected_array) / expected_norm < .02, name
+
+
+@pytest.mark.skipif(os.getenv("RUN_MODEL_TESTS") != "1", reason="set RUN_MODEL_TESTS=1 for model downloads")
+@pytest.mark.parametrize("model_name", ["mlx-community/nomicai-modernbert-embed-base-4bit",
+                                      "mlx-community/embeddinggemma-300m-4bit"])
+def test_autodiff_cache_matches_same_chunk_reference_in_low_precision(model_name):
+    from grad_cache import cached_value_and_grad, capture_rng, restore_rng
+    from training_data import make_batch, teacher_groups
+    from test_cached_training import ROWS, objective_for
+    from mlx.utils import tree_flatten
+
+    mx.random.seed(431)
+    model, tokenizer = load_encoder(model_name)
+    train.apply_lora_to_model(model, rank=2, dropout=.15)
+    train.freeze_base_and_enable_lora(model)
+    for _, module in model.named_modules():
+        if isinstance(module, train.LoRALinear):
+            module.lora_b = mx.random.normal(module.lora_b.shape) * .002
+    model.train()
+    mx.eval(model.parameters())
+    original_dtypes = [(name, value.dtype) for name, value in tree_flatten(model.parameters())]
+    teacher = {q: {doc: i / 10 for i, doc in enumerate(docs)} for q, docs in teacher_groups(ROWS).items()}
+    batch = make_batch(ROWS, multi_positive=True, teacher=teacher)
+    chunks = lambda texts: [train.tokenize_batch(tokenizer, texts[i:i+2]) for i in range(0, len(texts), 2)]
+    q, c = chunks(batch.queries), chunks(batch.candidates)
+    kwarg = train.detect_input_kwarg(model)
+    encode = lambda m, t: train.encode_texts(m, **t, input_kwarg=kwarg)
+    loss = objective_for(batch, hardness=2, dims=[128, 64], distill=.2)
+    before = capture_rng()
+
+    def reference(m):
+        qe = mx.concatenate([encode(m, t) for t in q])
+        ce = mx.concatenate([encode(m, t) for t in c])
+        return loss(qe, ce, 0, len(ROWS))
+
+    expected, eg = nn.value_and_grad(model, reference)(model)
+    mx.eval(expected, eg)
+    after = capture_rng()
+    restore_rng(before)
+    actual, ag = cached_value_and_grad(model, encode, q, c, loss, 1, "autodiff")
+    mx.eval(actual, ag)
+    assert actual.item() == pytest.approx(expected.item(), abs=2e-6)
+    assert capture_rng() == after
+    assert original_dtypes == [(name, value.dtype) for name, value in tree_flatten(model.parameters())]
+    a, e = [], []
+    for (name, g), (ename, target) in zip(tree_flatten(ag), tree_flatten(eg)):
+        assert name == ename
+        np.testing.assert_allclose(np.array(g), np.array(target), atol=2e-6, rtol=2e-5, err_msg=name)
+        a.append(np.array(g).ravel())
+        e.append(np.array(target).ravel())
+    a, e = np.concatenate(a), np.concatenate(e)
+    assert np.linalg.norm(a-e) / np.linalg.norm(e) < 1e-5

@@ -30,6 +30,12 @@ defect and records that model's current limitation.
 
 ## What the tests establish
 
+The subsequent [cache-forward experiment](replay-consistency.md) extends the
+objective/dropout matrix to both plain and autodiff cache passes, adds tight
+same-chunk ModernBERT/Gemma gradient comparisons without precision promotion,
+and records reproducible synthetic memory/timing measurements. These checks
+do not promote Gemma's separate padding behavior to verified correctness.
+
 | Area | Checks |
 |---|---|
 | Retrieval | Chunked rankings and scalar metrics match independent references across 150 randomized cases; ties, cutoffs and multiple positives are covered |

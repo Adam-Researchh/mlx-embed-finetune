@@ -12,7 +12,7 @@ normalization and export/reload behavior.
 | `mlx-community/all-MiniLM-L6-v2-bf16` | BERT, `bert/xlm-roberta` | 12 | Training/export/reload, parameter-gradient parity, and real LoRA checks with all objectives and dropout |
 | `mlx-community/all-MiniLM-L6-v2-4bit` | BERT, `bert/xlm-roberta` | 12 | QLoRA training/export/reload, per-layer quantization configuration, cache parity and the full combined-feature workflow |
 | `mlx-community/nomicai-modernbert-embed-base-bf16` | ModernBERT, `modernbert` | 44 | CI forward/backward checks and offline teacher scoring |
-| `mlx-community/nomicai-modernbert-embed-base-4bit` | ModernBERT, `modernbert` | 44 | Local combined-feature forward/backward check with cache, multi-positive loss, distillation, MRL, hardness and dropout |
+| `mlx-community/nomicai-modernbert-embed-base-4bit` | ModernBERT, `modernbert` | 44 | Combined-feature forward/backward and experimental autodiff cache gradient parity with unchanged precision |
 | `mlx-community/embeddinggemma-300m-4bit` | Gemma 3, `decoder-style` | 48 | Execution checks pass, but an upstream padding defect is confirmed; see the limitation below |
 | `mlx-community/bge-m3-mlx-fp16` | XLM-RoBERTa, `bert/xlm-roberta` | 48 | Original training workflow and historical measurements; not the current full export-parity CI fixture |
 
@@ -21,6 +21,8 @@ measurements; see [validation](validation.md) and [benchmark results](../benchma
 A forward/backward check proves execution with a finite nonzero gradient. The
 full export-parity checks are currently concentrated on MiniLM. This table does
 not certify every quantization, long-context configuration or upstream revision.
+Gemma's experimental autodiff cache check compares identical padded chunks;
+it does not establish that the model handles padding correctly.
 
 ## Known quantized EmbeddingGemma limitation
 
