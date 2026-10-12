@@ -45,6 +45,9 @@ from mlx_embeddings.utils import get_model_path, load_model
 from mlx_lm.tuner.lora import LoRALinear
 
 from retrieval import file_digest, known_positives, load_corpus, load_pairs
+from training_data import load_teacher_scores, make_batch
+from objectives import embedding_objective
+from grad_cache import cached_value_and_grad
 
 DEFAULT_MODEL = "mlx-community/bge-m3-mlx-fp16"
 DEFAULT_TEMPERATURE = 0.05
@@ -291,6 +294,8 @@ def encode_texts(
     """
     output = model(**{input_kwarg: input_ids}, attention_mask=attention_mask)
     embeds = output.text_embeds
+    if embeds.ndim != 2 or embeds.shape[0] != input_ids.shape[0]:
+        raise ValueError("Training requires one embedding vector per input; token-level outputs are unsupported")
     return l2_normalize(embeds) if normalize else embeds
 
 
@@ -385,23 +390,39 @@ def evaluate_loss(
     query_prefix: str = "",
     doc_prefix: str = "",
     input_kwarg: str = "input_ids",
+    multi_positive: bool = False,
+    encoding_chunk_size: int = 0,
+    loss_chunk_size: int = 64,
 ) -> float:
     total_loss = 0.0
     num_queries = 0
     relevant = known_positives(eval_pairs)
-    for queries, positives, negatives in batch_pairs(eval_pairs, batch_size):
-        if not use_hard_negatives:
-            negatives = []
-        q_tokens = tokenize_batch(tokenizer, apply_prefix(queries, query_prefix), max_length)
-        c_texts = apply_prefix(positives + negatives, doc_prefix)
-        c_tokens = tokenize_batch(tokenizer, c_texts, max_length)
-        q_embeds = encode_texts(model, q_tokens["input_ids"], q_tokens["attention_mask"], normalize, input_kwarg)
-        c_embeds = encode_texts(model, c_tokens["input_ids"], c_tokens["attention_mask"], normalize, input_kwarg)
-        mask = build_false_negative_mask(positives, negatives, [relevant[q] for q in queries])
-        loss = info_nce_loss(q_embeds, c_embeds, temperature, mask)
-        mx.eval(loss)
-        total_loss += loss.item() * len(queries)
-        num_queries += len(queries)
+    encoding_chunk_size = encoding_chunk_size or batch_size
+
+    def encode_chunks(texts, prefix):
+        texts = apply_prefix(texts, prefix)
+        embeds = []
+        for offset in range(0, len(texts), encoding_chunk_size):
+            tokens = tokenize_batch(tokenizer, texts[offset:offset + encoding_chunk_size], max_length)
+            out = encode_texts(model, **tokens, normalize=normalize, input_kwarg=input_kwarg)
+            mx.eval(out)
+            embeds.append(out)
+        return mx.concatenate(embeds)
+
+    for start in range(0, len(eval_pairs), batch_size):
+        batch = make_batch(eval_pairs[start:start + batch_size], relevant,
+                           multi_positive, use_hard_negatives)
+        q_embeds = encode_chunks(batch.queries, query_prefix)
+        c_embeds = encode_chunks(batch.candidates, doc_prefix)
+        for offset in range(0, len(batch.queries), loss_chunk_size):
+            stop = min(offset + loss_chunk_size, len(batch.queries))
+            loss = embedding_objective(
+                q_embeds[offset:stop], c_embeds, mx.array(batch.positive_mask[offset:stop]),
+                mx.array(batch.valid_mask[offset:stop]), temperature,
+            )
+            mx.eval(loss)
+            total_loss += loss.item() * (stop - offset)
+        num_queries += len(batch.queries)
     return total_loss / max(num_queries, 1)
 
 
@@ -558,6 +579,16 @@ def validate_args(args):
         raise ValueError("--eval-corpus and retrieval checkpoint selection require --eval-pairs")
     if args.best_metric != "loss" and args.eval_every == 0:
         raise ValueError("Retrieval checkpoint selection requires evaluation to be enabled")
+    if args.cache_chunk_size < 0 or args.loss_chunk_size < 1:
+        raise ValueError("--cache-chunk-size must be nonnegative and --loss-chunk-size positive")
+    if not math.isfinite(args.distill_weight) or args.distill_weight < 0:
+        raise ValueError("--distill-weight must be finite and nonnegative")
+    if not math.isfinite(args.distill_temperature) or args.distill_temperature <= 0:
+        raise ValueError("--distill-temperature must be finite and positive")
+    if bool(args.teacher_scores) != bool(args.distill_weight):
+        raise ValueError("Use --teacher-scores with a positive --distill-weight (or omit both)")
+    if args.teacher_scores and (args.no_normalize or args.no_hard_negatives):
+        raise ValueError("Distillation requires normalization and the explicit candidate groups")
 
 
 def validate_training_step(loss, grads, require_nonzero=False):
@@ -595,6 +626,9 @@ def train(args):
     print(f"Hard negatives:   {not args.no_hard_negatives}")
     print(f"Hardness weight:  {args.hardness_strength}")
     print(f"Best metric:      {args.best_metric}")
+    print(f"Multi-positive:   {args.multi_positive}")
+    print(f"Encoding cache:   {args.cache_chunk_size or 'disabled'}")
+    print(f"Distill weight:   {args.distill_weight}")
     print(f"Query prefix:     {args.query_prefix!r}")
     print(f"Doc prefix:       {args.doc_prefix!r}")
     print(f"Target modules:   {args.target_modules}")
@@ -648,14 +682,31 @@ def train(args):
     print(f"Trainable parameters: {trainable_params / 1e6:.3f}M ({trainable_params * 100 / total_params:.2f}%)")
 
     print("\nStep 3: Loading data...")
+    train_sha256 = file_digest(args.train_pairs)
+    eval_sha256 = file_digest(args.eval_pairs) if args.eval_pairs else None
     train_pairs = load_pairs(args.train_pairs)
     eval_pairs = load_pairs(args.eval_pairs) if args.eval_pairs else None
+    if (file_digest(args.train_pairs) != train_sha256
+            or (args.eval_pairs and file_digest(args.eval_pairs) != eval_sha256)):
+        raise ValueError("Dataset changed while loading; use stable input files")
     if not train_pairs:
         raise ValueError(f"No usable training pairs in {args.train_pairs}")
     train_relevant = known_positives(train_pairs)
     eval_corpus = load_corpus(args.eval_corpus) if args.eval_corpus else None
     if eval_pairs and set(train_relevant) & set(known_positives(eval_pairs)):
         raise ValueError("Train/eval queries overlap; split queries before mining or training")
+    teacher = None
+    teacher_manifest = None
+    teacher_scores_sha256 = None
+    if args.teacher_scores:
+        teacher_scores_sha256 = file_digest(args.teacher_scores)
+        teacher, teacher_manifest = load_teacher_scores(
+            args.teacher_scores, train_pairs, train_sha256)
+        if file_digest(args.teacher_scores) != teacher_scores_sha256:
+            raise ValueError("Teacher score file changed while loading")
+        # Validate every row's distillation group before training starts.
+        for row in train_pairs:
+            make_batch([row], train_relevant, args.multi_positive, use_hard_negatives, teacher)
     with_negatives = sum(1 for p in train_pairs if p.get("negatives"))
     print(f"Loaded {len(train_pairs)} training pairs ({with_negatives} with hard negatives)")
     if use_hard_negatives and with_negatives == 0:
@@ -683,52 +734,57 @@ def train(args):
     print(f"Optimizer: AdamW (decoupled weight decay={args.weight_decay})")
     print(f"LR schedule: linear warmup ({warmup_steps} steps) -> cosine decay")
 
-    def loss_fn(model, q_ids, q_mask, c_ids, c_mask, fn_mask):
-        q_embeds = encode_texts(model, q_ids, q_mask, normalize, input_kwarg)
-        c_embeds = encode_texts(model, c_ids, c_mask, normalize, input_kwarg)
-        if matryoshka_dims:
-            return matryoshka_loss(q_embeds, c_embeds, matryoshka_dims, args.temperature, fn_mask, args.hardness_strength)
-        return info_nce_loss(q_embeds, c_embeds, args.temperature, fn_mask, args.hardness_strength)
+    def encode_tokens(m, tokens):
+        return encode_texts(m, **tokens, normalize=normalize, input_kwarg=input_kwarg)
 
-    loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
+    def prepare_chunks(texts, prefix, chunk_size):
+        texts = apply_prefix(texts, prefix)
+        return [tokenize_batch(tokenizer, texts[i:i + chunk_size], args.max_length)
+                for i in range(0, len(texts), chunk_size)]
 
-    def prepare_batch(queries, positives, negatives):
-        if not use_hard_negatives:
-            negatives = []
-        q_tokens = tokenize_batch(tokenizer, apply_prefix(queries, args.query_prefix), args.max_length)
-        c_tokens = tokenize_batch(
-            tokenizer, apply_prefix(positives + negatives, args.doc_prefix), args.max_length
-        )
-        fn_mask = build_false_negative_mask(positives, negatives, [train_relevant[q] for q in queries])
-        return q_tokens, c_tokens, fn_mask
+    def batch_value_and_grad(rows):
+        batch = make_batch(rows, train_relevant, args.multi_positive, use_hard_negatives, teacher)
+        positive_mask, valid_mask = mx.array(batch.positive_mask), mx.array(batch.valid_mask)
+        teacher_values = mx.array(batch.teacher_scores) if teacher else None
+        teacher_mask = mx.array(batch.teacher_mask) if teacher else None
+
+        def loss_for_rows(q, c, start, stop):
+            return embedding_objective(
+                q, c, positive_mask[start:stop], valid_mask[start:stop],
+                args.temperature, args.hardness_strength, matryoshka_dims,
+                teacher_values[start:stop] if teacher else None,
+                teacher_mask[start:stop] if teacher else None,
+                args.distill_weight, args.distill_temperature,
+            )
+
+        if args.cache_chunk_size:
+            q_chunks = prepare_chunks(batch.queries, args.query_prefix, args.cache_chunk_size)
+            c_chunks = prepare_chunks(batch.candidates, args.doc_prefix, args.cache_chunk_size)
+            return cached_value_and_grad(model, encode_tokens, q_chunks, c_chunks,
+                                          loss_for_rows, args.loss_chunk_size)
+        q_tokens = prepare_chunks(batch.queries, args.query_prefix, len(batch.queries))[0]
+        c_tokens = prepare_chunks(batch.candidates, args.doc_prefix, len(batch.candidates))[0]
+
+        def loss_fn(m):
+            return loss_for_rows(encode_tokens(m, q_tokens), encode_tokens(m, c_tokens), 0, len(rows))
+
+        return nn.value_and_grad(model, loss_fn)(model)
 
     model.train()
     if args.dry_run:
-        print("\n" + "=" * 60)
-        print("DRY RUN")
-        print("=" * 60)
-        queries, positives, negatives = next(batch_pairs(train_pairs, args.batch_size))
-        q_tokens, c_tokens, fn_mask = prepare_batch(queries, positives, negatives)
-        print(f"Batch size: {len(queries)} queries vs {c_tokens['input_ids'].shape[0]} candidates "
-              f"({len(positives)} positives + {c_tokens['input_ids'].shape[0] - len(positives)} hard negatives)")
-        print(f"Query token shape:     {q_tokens['input_ids'].shape}")
-        print(f"Candidate token shape: {c_tokens['input_ids'].shape}")
-        print(f"False-negative mask:   {'applied' if fn_mask is not None else 'not needed'}")
+        print("\nDRY RUN")
+        rows = train_pairs[:args.batch_size]
+        batch = make_batch(rows, train_relevant, args.multi_positive, use_hard_negatives, teacher)
+        print(f"Contrastive batch: {len(rows)} queries vs {len(batch.candidates)} candidates")
         t0 = time.time()
-        loss, grads = loss_and_grad_fn(
-            model,
-            q_tokens["input_ids"], q_tokens["attention_mask"],
-            c_tokens["input_ids"], c_tokens["attention_mask"],
-            fn_mask,
-        )
-        _, grad_norm = validate_training_step(loss, grads, require_nonzero=True)
+        loss, grads = batch_value_and_grad(rows)
+        loss_value, grad_norm = validate_training_step(loss, grads, require_nonzero=True)
         elapsed = time.time() - t0
-        print(f"Loss: {loss.item():.4f}")
+        print(f"Loss: {loss_value:.6f}")
         print(f"Gradient L2 norm: {grad_norm:.6f}")
         print(f"Forward + backward: {elapsed:.2f}s")
-        print(f"Throughput: {len(queries) / elapsed:.1f} pairs/s")
+        print(f"Throughput: {len(rows) / elapsed:.1f} pairs/s")
         print(f"Estimated epoch time: {micro_steps_per_epoch * elapsed / 60:.1f} min")
-        print(f"Estimated total time: {micro_steps_per_epoch * args.epochs * elapsed / 60:.1f} min")
         print("Dry run completed successfully.")
         return
 
@@ -785,13 +841,15 @@ def train(args):
                 value = evaluate_loss(
                     model, tokenizer, eval_pairs, args.batch_size, args.temperature,
                     args.max_length, normalize, use_hard_negatives,
-                    args.query_prefix, args.doc_prefix, input_kwarg,
+                    args.query_prefix, args.doc_prefix, input_kwarg, args.multi_positive,
+                    args.cache_chunk_size, args.loss_chunk_size,
                 )
                 metrics = {"loss": value}
                 if args.best_metric != "loss" or eval_corpus is not None:
                     from evaluate import evaluate_loaded_model
                     result = evaluate_loaded_model(
-                        model, tokenizer, eval_pairs, args.max_length, args.batch_size,
+                        model, tokenizer, eval_pairs, args.max_length,
+                        args.cache_chunk_size or args.batch_size,
                         normalize, args.query_prefix, args.doc_prefix, corpus_texts=eval_corpus,
                     )["retrieval"]
                     metrics.update(ndcg_at_10=result["ndcg_at_10"],
@@ -832,18 +890,15 @@ def train(args):
                 accumulated = None
                 loss_sum = 0.0
                 step_start = time.time()
-                for queries, positives, negatives in batch_pairs(window, args.batch_size):
-                    q_tokens, c_tokens, fn_mask = prepare_batch(queries, positives, negatives)
-                    loss, grads = loss_and_grad_fn(
-                        model, q_tokens["input_ids"], q_tokens["attention_mask"],
-                        c_tokens["input_ids"], c_tokens["attention_mask"], fn_mask,
-                    )
+                for micro_offset in range(0, len(window), args.batch_size):
+                    rows = window[micro_offset:micro_offset + args.batch_size]
+                    loss, grads = batch_value_and_grad(rows)
                     loss_value, _ = validate_training_step(loss, grads)
-                    weight = len(queries) / len(window)
+                    weight = len(rows) / len(window)
                     weighted = tree_map(lambda g: g * weight, grads)
                     accumulated = weighted if accumulated is None else tree_map(mx.add, accumulated, weighted)
                     mx.eval(accumulated)
-                    loss_sum += loss_value * len(queries)
+                    loss_sum += loss_value * len(rows)
                 loss_value = loss_sum / len(window)
                 validate_training_step(mx.array(loss_value), accumulated)
                 optimizer.update(model, accumulated)
@@ -890,9 +945,16 @@ def train(args):
                        "best_step": best_step, "best_metric": args.best_metric,
                        "best_value": best_value, "matryoshka_dims": matryoshka_dims,
                        "hardness_strength": args.hardness_strength,
+                       "multi_positive": args.multi_positive,
+                       "cache_chunk_size": args.cache_chunk_size,
+                       "loss_chunk_size": args.loss_chunk_size,
+                       "distill_weight": args.distill_weight,
+                       "distill_temperature": args.distill_temperature,
+                       "teacher_manifest": teacher_manifest,
+                       "teacher_scores_sha256": teacher_scores_sha256,
                        "max_length": args.max_length,
-                       "train_sha256": file_digest(args.train_pairs),
-                       "eval_sha256": file_digest(args.eval_pairs) if args.eval_pairs else None,
+                       "train_sha256": train_sha256,
+                       "eval_sha256": eval_sha256,
                    })
     print("Done.")
 
@@ -921,9 +983,20 @@ Examples:
                         help="Detached cosine penalty on all negatives; 0 preserves standard InfoNCE")
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Model path or repository (default: {DEFAULT_MODEL})")
     parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
-    parser.add_argument("--batch-size", type=int, default=16, help="Micro-batch size (pairs per forward pass)")
+    parser.add_argument("--batch-size", type=int, default=16, help="Queries per contrastive loss; with GradCache this can exceed the encoding chunk size")
     parser.add_argument("--grad-accum-steps", type=int, default=1,
                         help="Accumulate gradients over N micro-batches before an optimizer step")
+    parser.add_argument("--multi-positive", action="store_true",
+                        help="Train uniformly on all known positives and deduplicate candidates")
+    parser.add_argument("--cache-chunk-size", type=int, default=0,
+                        help="Enable GradCache, encoding at most N texts at once; batch-size is the logical contrastive batch")
+    parser.add_argument("--loss-chunk-size", type=int, default=64,
+                        help="Queries per embedding-loss gradient chunk in GradCache mode")
+    parser.add_argument("--teacher-scores", help="Offline teacher ranking JSONL generated by teacher.py")
+    parser.add_argument("--distill-weight", type=float, default=0.0,
+                        help="Add this weight times teacher-to-student ranking KL to contrastive loss")
+    parser.add_argument("--distill-temperature", type=float, default=.1,
+                        help="Temperature applied to both teacher and student distillation scores")
     parser.add_argument("--learning-rate", type=float, default=2e-5, help="Peak learning rate")
     parser.add_argument("--weight-decay", type=float, default=0.01, help="Weight decay")
     parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE, help="Contrastive loss temperature")

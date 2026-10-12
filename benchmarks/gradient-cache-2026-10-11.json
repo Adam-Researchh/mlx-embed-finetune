@@ -1,0 +1,38 @@
+{
+  "date": "2026-10-11",
+  "uncached": {
+    "config": {
+      "model": "mlx-community/all-MiniLM-L6-v2-bf16",
+      "queries": 32,
+      "sequence_length": 128,
+      "cache_chunk_size": 0
+    },
+    "loss": 5.016234874725342,
+    "gradient_norm": 0.03689146786928177,
+    "peak_mlx_bytes": 5433458220,
+    "seconds": 0.3495908749755472,
+    "mlx_version": "0.32.2",
+    "dropout_enabled": false,
+    "kind": "synthetic forward/backward; no optimizer update or quality benchmark"
+  },
+  "cached": {
+    "config": {
+      "model": "mlx-community/all-MiniLM-L6-v2-bf16",
+      "queries": 32,
+      "sequence_length": 128,
+      "cache_chunk_size": 4
+    },
+    "loss": 5.0162353515625,
+    "gradient_norm": 0.03689153492450714,
+    "peak_mlx_bytes": 429008514,
+    "seconds": 0.9327140419045463,
+    "mlx_version": "0.32.2",
+    "dropout_enabled": false,
+    "kind": "synthetic forward/backward; no optimizer update or quality benchmark"
+  },
+  "peak_reduction_fraction": 0.9210431926354262,
+  "hardware": {
+    "chip": "Apple M1 Ultra",
+    "unified_memory_bytes": 137438953472
+  }
+}

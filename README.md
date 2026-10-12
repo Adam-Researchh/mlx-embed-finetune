@@ -56,6 +56,9 @@ nonfinite. Training also checks for nonfinite values before every update.
   pooled across the batch, not just in-batch negatives
 - **False-negative masking** for all known positives of a query, including
   additional relevant documents and positives recorded on other rows
+- **True multi-positive training** with uniform supervision over every known relevant answer
+- **GradCache** for logical contrastive batches larger than the encoding chunk
+- **Offline teacher-ranking distillation** using cached scores, with no teacher at serving time
 - **Negative mining** with optional embedding-teacher margin filtering
 - Optional **hardness-weighted InfoNCE**, controlled by `--hardness-strength`
 - **Matryoshka (MRL)** multi-dimension loss, so embeddings stay useful when
@@ -89,8 +92,10 @@ Additional relevant answers can be listed in `positives`:
 {"query":"reset my password","positive":"Open account settings to reset it.","positives":["Use the password recovery page."],"negatives":["Change your display name."]}
 ```
 
-The `positive` field remains the training target; other known positives are
-masked out of the negative pool. Evaluation counts all known positives, merging
+By default, `positive` is the training target and other known positives are
+masked out of the negative pool. With `--multi-positive`, all known positives
+become supervised targets and candidates are deduplicated. Evaluation counts
+all known positives, merging
 relevance for identical query text across rows. Each input row contributes to
 the metric average. JSONL parsing is strict: malformed rows, empty strings, and
 invalid negative lists raise with a file and line number.
@@ -119,8 +124,14 @@ exact-query overlap check is only a basic leakage guard.
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--batch-size` | 16 | Micro-batch: queries per forward pass |
-| `--grad-accum-steps` | 1 | Effective batch = batch-size × this |
+| `--batch-size` | 16 | Queries sharing one contrastive candidate pool |
+| `--grad-accum-steps` | 1 | Optimizer batch = batch-size × this; separate contrastive pools |
+| `--multi-positive` | off | Supervise every known positive; deduplicate candidate documents |
+| `--cache-chunk-size` | 0 | `0` disables caching; otherwise encode/replay at most this many texts |
+| `--loss-chunk-size` | 64 | Query rows per cached embedding-loss gradient computation |
+| `--teacher-scores` | none | Offline JSONL scores from `teacher.py` |
+| `--distill-weight` | 0 | Add this coefficient times ranking KL; requires teacher scores |
+| `--distill-temperature` | 0.1 | Softmax temperature for teacher and student ranking scores |
 | `--target-modules` | `auto` | `auto`, `all-linear`, names (`query,value`), or regexes |
 | `--query-prefix` / `--doc-prefix` | empty | Instruction prefixes |
 | `--no-hard-negatives` | off | Ignore `negatives`, in-batch only |
@@ -134,6 +145,101 @@ exact-query overlap check is only a basic leakage guard.
 | `--hardness-strength` | 0 | Detached cosine penalty on all unmasked negatives; try `2` as an experiment |
 | `--temperature` | 0.05 | InfoNCE temperature (assumes unit vectors) |
 | `--seed` | none | Set for reproducible shuffling |
+
+## Larger contrastive batches and multiple positives
+
+```bash
+python train.py \
+  --train-pairs data/train.jsonl --eval-pairs data/validation.jsonl \
+  --model mlx-community/all-MiniLM-L6-v2-bf16 \
+  --multi-positive --batch-size 64 --cache-chunk-size 8 --loss-chunk-size 16 \
+  --best-metric ndcg_at_10 --seed 42 --output-dir outputs/cached-run
+```
+
+Here, all **64 queries share one candidate pool**, including their positives
+and explicit negatives. Only eight query/document texts are encoded at a time.
+The model first computes embeddings without retaining encoder activations,
+then differentiates the shared embedding loss, then replays each encoding
+chunk with its cached embedding gradient. `--grad-accum-steps 2` would accumulate
+two independent 64-query losses, not create a 128-query candidate pool.
+
+Multi-positive training averages the negative log probability of **each**
+positive for each query, then averages across queries. It therefore rewards a
+harder relevant answer even if an easier answer already ranks well. Relevance
+is merged across identical query text throughout the training file; all known
+answers for a batch query are included. Repeated query rows retain their data
+weight. Hardness weighting applies only to negatives, never known positives.
+
+GradCache restores the exact RNG key for each replay, including dropout.
+With dropout active, parity is against an ordinary backward pass using the
+same encoding chunks and random masks; changing batch shapes can change masks.
+The caller's random stream advances once through encoding, not twice. Current
+encoder forwards must be stateless apart from RNG; BatchNorm models are rejected.
+
+Memory still grows with the stored embeddings, token inputs, masks, teacher
+scores, and embedding gradients. `--loss-chunk-size` bounds the score matrix
+used by each cached loss-gradient computation. Validation also respects the
+encoding chunk limit. Caching adds a forward replay; it is a memory feature,
+not a promise of faster updates. See [the reproducible measurement](benchmarks/gradient-cache.md).
+
+## Distill teacher rankings offline
+
+Score the training groups once with a teacher, then train the student:
+
+```bash
+python teacher.py \
+  --train-pairs data/train.jsonl \
+  --model mlx-community/nomicai-modernbert-embed-base-bf16 \
+  --query-prefix "search_query: " --doc-prefix "search_document: " \
+  --output outputs/teacher-scores.jsonl
+
+python train.py \
+  --train-pairs data/train.jsonl --eval-pairs data/validation.jsonl \
+  --model mlx-community/all-MiniLM-L6-v2-4bit \
+  --multi-positive --batch-size 64 --cache-chunk-size 8 \
+  --teacher-scores outputs/teacher-scores.jsonl --distill-weight 0.2 \
+  --distill-temperature 0.1 --best-metric ndcg_at_10 \
+  --output-dir outputs/distilled-run
+```
+
+The teacher runs in evaluation mode with its own prompt recipe. It scores each
+query against the union of that query's positives and explicit negatives. Mine
+negatives first if a query has fewer than two candidates. The teacher and
+student can have different embedding dimensions: we match **rank distributions**,
+not embedding coordinates. No teacher model is loaded during student training.
+
+The objective is `contrastive_loss + distill_weight * KL(teacher || student)`.
+Both ranking distributions use `distill_temperature`; no temperature-squared
+factor is applied. The KL term uses full-dimensional student cosine scores;
+optional Matryoshka dimensions retain their supervised contrastive losses.
+Only scored candidates participate in KL. Other in-batch documents still
+participate in the contrastive loss without receiving invented teacher labels.
+Scored groups are included in the batch pool, and each valid document receives
+teacher probability once. With single-positive mode, alternate known positives
+remain masked; at least two valid scored candidates must remain for each query.
+
+`teacher.py` writes cosine scores. An external reranker can write the same JSONL
+schema with calibrated scores (larger means more relevant); this project does
+not run that reranker or automatically calibrate its raw logits. The first line
+is a manifest, followed by one record per unique query:
+
+```json
+{"type":"teacher_manifest","schema_version":1,"train_sha256":"SHA256_OF_THE_EXACT_TRAIN_FILE","teacher":"model identifier"}
+{"query":"search query","scores":[{"document":"relevant document","score":0.9},{"document":"hard negative","score":0.3}]}
+```
+
+Every training query and every document in its fixed group must be scored
+exactly once. Unknown, duplicate, missing or nonfinite scores are rejected.
+The training-file hash must match; regenerate scores after editing or mining
+the dataset. Scores stay attached to text identities during shuffling and
+candidate deduplication. Validation uses supervised full-dimension contrastive
+loss and/or retrieval metrics, without training teacher labels. Compare recipes
+on held-out retrieval, since mixed training losses are not directly comparable.
+
+All three features are independently selectable and work together with LoRA,
+QLoRA, accumulation, Matryoshka loss, hardness weighting and checkpoint export.
+Exports still produce one vector per text and need no teacher at inference.
+Deploying changed embedding weights generally requires re-embedding the corpus.
 
 ## Evaluation
 
@@ -279,8 +385,7 @@ to demonstrate that fine-tuning helped.
   or RNG state. Exact training resume is not implemented.
 - Gradient accumulation averages several micro-batch gradients. It does not
   give you the larger *in-batch negative pool* that a genuinely larger batch
-  would — for that you need GradCache-style caching, which this does not
-  implement.
+  would. Use a larger `--batch-size` with `--cache-chunk-size` for that.
 
 ## Tests
 
@@ -293,8 +398,9 @@ RUN_MODEL_TESTS=1 python -m pytest -q
 
 CI runs pure data/mining/metric tests on Linux and the full regression suite,
 architecture smoke tests, mining CLI, and export parity checks on Apple Silicon.
-GradCache and teacher-score distillation remain follow-up work; this release
-establishes the evaluation and correctness foundation for those experiments.
+Tests cover loss and parameter-gradient parity, dropout replay, multi-positive
+labels, teacher cache validation, all feature combinations, real bf16/QLoRA
+models, and training through exported-model evaluation.
 
 ## License
 
@@ -306,3 +412,4 @@ Apache 2.0. See [`LICENSE`](LICENSE).
 - [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) by Prince Canuma
 - [Sentence-Transformers](https://www.sbert.net/) for the loss vocabulary this borrows
 - Matryoshka Representation Learning ([Kusupati et al., 2022](https://arxiv.org/abs/2205.13147))
+- Gradient caching ([Gao et al., 2021](https://arxiv.org/abs/2101.06983))
