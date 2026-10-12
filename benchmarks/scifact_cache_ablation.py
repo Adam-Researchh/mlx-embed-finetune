@@ -41,7 +41,8 @@ PROTOCOL = {
 def get_model(seed, float32=False):
     from huggingface_hub import snapshot_download
     mx.random.seed(seed)
-    path = Path(snapshot_download(PROTOCOL["model"], revision=PROTOCOL["revision"], local_files_only=True))
+    path = Path(snapshot_download(PROTOCOL["model"], revision=PROTOCOL["revision"], local_files_only=True,
+                                  allow_patterns=["*.json", "*.safetensors", "*.py", "*.tiktoken", "*.txt", "*.model"]))
     model = train.load_model(path, lazy=False)
     tokenizer = train.load_tokenizer(path)
     if float32:
